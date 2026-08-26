@@ -52,11 +52,13 @@ BG_COLOR = "white"
 GUTTER_FG = "#666666"
 GUTTER_BG = "#f0f0f0"
 REVEAL_BG = "#ffe9a8"
-# Clicking a dict key washes its whole value in this.
-VALUE_BG = "#e4e4e4"
+# "very light gray", shared by the dict-value wash and the selected row in either tree. Darken it here if it reads
+# too faint on your display; both uses are meant to be noticed without competing with the status colours.
+VERY_LIGHT_GRAY = "#eeeeee"
+VALUE_BG = VERY_LIGHT_GRAY
 LINK_COLOR = "#1a5fb4"
-# N: a selected tree row is light grey and keeps whatever colour its status gave it.
-TREE_SELECT_BG = "#d9d9d9"
+# A selected tree row is washed in the same very light grey and keeps whatever colour its status gave it.
+TREE_SELECT_BG = VERY_LIGHT_GRAY
 TREE_STYLE = "Status.Treeview"
 # A tree with tens of thousands of rows is slow to build and unusable to scroll: cap it and say so.
 MAX_TREE_ROWS = 2000

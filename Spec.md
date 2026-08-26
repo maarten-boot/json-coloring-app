@@ -126,7 +126,7 @@ as a tree on the `right tree list`.
 When selecting a word enclosed in quotes in the `text window`, place it in the search entry and execute a search with its value.
 
 
-The selected line in both tree lists should be a light gray,
+The selected line in both tree lists should be a `very light gray`,
 and the word highlighted should keep the color it had before the highlight.
 
 
