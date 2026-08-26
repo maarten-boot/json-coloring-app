@@ -52,6 +52,8 @@ BG_COLOR = "white"
 GUTTER_FG = "#666666"
 GUTTER_BG = "#f0f0f0"
 REVEAL_BG = "#ffe9a8"
+# Clicking a dict key washes its whole value in this.
+VALUE_BG = "#e4e4e4"
 LINK_COLOR = "#1a5fb4"
 # N: a selected tree row is light grey and keeps whatever colour its status gave it.
 TREE_SELECT_BG = "#d9d9d9"
@@ -60,6 +62,8 @@ TREE_STYLE = "Status.Treeview"
 MAX_TREE_ROWS = 2000
 # How long the pointer must rest on a coloured item before its origin is named.
 HOVER_DELAY_MS = 400
+# Typing in the match box scans the whole buffer, so wait for a pause before running it.
+MATCH_SEARCH_DELAY_MS = 250
 # A hover names every status that contributed; past this many the rest are summarised.
 MAX_HOVER_ORIGINS = 6
 TOOLTIP_BG = "#ffffe0"
@@ -101,6 +105,8 @@ KEEP_MARKED_LISTS_OPEN = True
 STATUS_RE = re.compile(r'^\s*"status"\s*:\s*(?P<value>.*?)\s*,?\s*$')
 # Splits an object member into its key and whatever follows the colon.
 MEMBER_RE = re.compile(r'^"(?P<key>(?:[^"\\]|\\.)*)"\s*:\s*(?P<rest>.*)$')
+# A dict member split into its key, its value and any trailing comma, used to shade a value on demand.
+VALUE_RE = re.compile(r'^(?P<lead>\s*"(?:[^"\\]|\\.)*"\s*:\s*)(?P<value>.*?),?\s*$')
 # The quoted key at the head of a line, used to colour breadcrumbs.
 KEY_RE = re.compile(r'^(?P<indent>\s*)(?P<key>"(?:[^"\\]|\\.)*")\s*:')
 # A key that can be written as .key rather than ["key"].
@@ -419,6 +425,15 @@ def _base_segment(part: str) -> str:
     return part.split("[", 1)[0]
 
 
+def value_span(line: str) -> tuple[int, int] | None:
+    """Column range of a dict member's value, trailing comma excluded, or None when the line holds no member."""
+    match = VALUE_RE.match(line)
+    if match is None or not match.group("value"):
+        return None
+    start = len(match.group("lead"))
+    return start, start + len(match.group("value"))
+
+
 def member_key(line: str) -> str | None:
     """The decoded key of the member on `line`, or None for array elements and bare brackets."""
     match = MEMBER_RE.match(line.strip())
@@ -658,6 +673,9 @@ class App(tk.Tk):
         self._syncing = False
         self._hover_after: str | None = None
         self._hover_spans: list[ColorSpan] = []
+        self._match_after: str | None = None
+        self._match_origin: int | None = None
+        self._setting_search = False
         self._match_lines: dict[str, int] = {}
         self.blocks = Blocks([])
         self.folded: set[int] = set()
@@ -772,22 +790,33 @@ class App(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
     def _build_matches(self, parent: ttk.Frame) -> None:
-        """A second tree, listing the paths of every line containing the quoted word selected in the text."""
-        parent.rowconfigure(1, weight=1)
+        """Search entry on top, then the tree of every line holding the searched text."""
+        parent.rowconfigure(2, weight=1)
         parent.columnconfigure(0, weight=1)
 
-        self.match_caption = tk.StringVar(value="Select a word in quotes to find it elsewhere")
+        search = ttk.Frame(parent, padding=(0, 0, 0, 4))
+        search.grid(row=0, column=0, columnspan=2, sticky="ew")
+        search.columnconfigure(1, weight=1)
+        ttk.Label(search, text="Find").grid(row=0, column=0, padx=(0, 4))
+        self.match_search_var = tk.StringVar()
+        entry = ttk.Entry(search, textvariable=self.match_search_var)
+        entry.grid(row=0, column=1, sticky="ew")
+        entry.bind("<Return>", lambda _event: self._run_match_search())
+        ttk.Button(search, text="\u2715", width=3, command=lambda: self.match_search_var.set("")).grid(row=0, column=2)
+        self.match_search_var.trace_add("write", self._on_match_search)
+
+        self.match_caption = tk.StringVar(value="Type a word, or click one in quotes")
         ttk.Label(parent, textvariable=self.match_caption, anchor="w", padding=(0, 0, 0, 4)).grid(
-            row=0, column=0, columnspan=2, sticky="ew"
+            row=1, column=0, columnspan=2, sticky="ew"
         )
 
         self.matches_tree = ttk.Treeview(parent, show="tree", selectmode="browse", style=TREE_STYLE)
-        self.matches_tree.grid(row=1, column=0, sticky="nsew")
+        self.matches_tree.grid(row=2, column=0, sticky="nsew")
 
         match_vbar = ttk.Scrollbar(parent, orient="vertical", command=self.matches_tree.yview)
-        match_vbar.grid(row=1, column=1, sticky="ns")
+        match_vbar.grid(row=2, column=1, sticky="ns")
         match_hbar = ttk.Scrollbar(parent, orient="horizontal", command=self.matches_tree.xview)
-        match_hbar.grid(row=2, column=0, sticky="ew")
+        match_hbar.grid(row=3, column=0, sticky="ew")
         self.matches_tree.configure(yscrollcommand=match_vbar.set, xscrollcommand=match_hbar.set)
 
         for value, color in STATUS_COLORS.items():
@@ -865,8 +894,9 @@ class App(tk.Tk):
         for value, color in STATUS_COLORS.items():
             self.text.tag_configure(REFERENCE_TAGS[value], foreground=color, underline=UNDERLINE_REFERENCES)
             self.text.tag_raise(REFERENCE_TAGS[value])
-        # "reveal" only paints a background, so it sits on top without disturbing the foreground priority.
+        # Both of these paint only a background, so they sit on top without disturbing the foreground priority.
         self.text.tag_configure("reveal", background=REVEAL_BG)
+        self.text.tag_configure("dictvalue", background=VALUE_BG)
 
         self.gutter.bind("<Button-1>", self._on_gutter_click)
         self.text.bind("<Double-Button-1>", self._on_text_double_click)
@@ -1037,7 +1067,8 @@ class App(tk.Tk):
         self._step("Filling the text window")
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        # Joined rather than one insert per line: no trailing blank line, so the gutter matches line for line.
+        # Joined rather than one insert per line: no trailing blank line, so widget line N stays current_json[N-1]
+        # and the gutter matches line for line.
         self.text.insert("1.0", "\n".join(self.current_json))
         self.text.mark_set("insert", "1.0")
         self.text.see("1.0")
@@ -1049,7 +1080,7 @@ class App(tk.Tk):
         collapsed = self._collapse_defaults()
         self._step("Building the path trees")
         self._fill_tree()
-        self._clear_matches("Select a word in quotes to find it elsewhere")
+        self._clear_matches("Type a word, or click one in quotes")
         self._set_current_line(None)
         self._refresh_gutter()
         return collapsed
@@ -1082,7 +1113,7 @@ class App(tk.Tk):
         thousand of them.
         """
         self._index_severity()
-        for tag in (*STATUS_COLORS, "reveal"):
+        for tag in (*STATUS_COLORS, "reveal", "dictvalue"):
             self.text.tag_remove(tag, "1.0", "end")
 
         ranges: dict[str, list[str]] = {value: [] for value in STATUS_COLORS}
@@ -1347,7 +1378,7 @@ class App(tk.Tk):
         """Rebuild the status-path tree, keeping only the entries matching the search pattern."""
         pattern = self.search_var.get().strip().lower()
         rows = [
-            TreeRow(entry.parts, f"{entry.parts[-1]} = {entry.value}", entry.value, entry.line)
+            TreeRow(entry.parts, f"{entry.parts[-1]} = {entry.value}  (line {entry.line})", entry.value, entry.line)
             for entry in self.status_paths
             if entry.parts and (not pattern or pattern in f"{entry.path} = {entry.value}".lower())
         ]
@@ -1356,7 +1387,34 @@ class App(tk.Tk):
         self._show_left_pane(bool(self.status_paths))
         return len(rows)
 
-    def _show_matches(self, needle: str, origin: int) -> None:
+    def _on_match_search(self, *_args: str) -> None:
+        """Queue a search. Typed text has no "search item", so any marker from an earlier click is dropped."""
+        if not self._setting_search:
+            self._match_origin = None
+        if self._match_after is not None:
+            self.after_cancel(self._match_after)
+        self._match_after = self.after(MATCH_SEARCH_DELAY_MS, self._run_match_search)
+
+    def _run_match_search(self) -> None:
+        """Run whatever is in the box now, cancelling any queued run."""
+        if self._match_after is not None:
+            self.after_cancel(self._match_after)
+            self._match_after = None
+        needle = self.match_search_var.get().strip().strip('"')
+        if not needle:
+            self._clear_matches("Type a word, or click one in quotes")
+            return
+        self._show_matches(needle, self._match_origin)
+
+    def _search_for(self, needle: str, origin: int | None) -> None:
+        """Put `needle` in the box and search at once, without waiting for the typing pause."""
+        self._match_origin = origin
+        self._setting_search = True
+        self.match_search_var.set(needle)
+        self._setting_search = False
+        self._run_match_search()
+
+    def _show_matches(self, needle: str, origin: int | None) -> None:
         """Fill the right-hand tree with the path of every line containing `needle`, the selected one included.
 
         Matching is plain containment against the raw line, so the word is found whether it is used as a key or as a
@@ -1364,20 +1422,32 @@ class App(tk.Tk):
         """
         rows: list[TreeRow] = []
         for number, line in enumerate(self.current_json, start=1):
-            if needle not in line:
+            column = line.find(needle)
+            if column < 0:
                 continue
             path = self.paths.get(number)
             if path is None or not path.parts:
                 continue
-            mark = "  \u25c2 selected" if number == origin else ""
+            mark = "  \u25c2 selected" if origin is not None and number == origin else ""
             label = f"{path.parts[-1]}  (line {number}){mark}"
-            rows.append(TreeRow(path.parts, label, self.value_of_line.get(number), number))
+            rows.append(TreeRow(path.parts, label, self._match_color(number, column), number))
 
         self._match_lines = self._fill_path_tree(self.matches_tree, rows).lines
         shortened = needle if len(needle) <= 32 else needle[:31] + "\u2026"
         phrase = "line contains" if len(rows) == 1 else "lines contain"
         self.match_caption.set(f'{len(rows)} {phrase} "{shortened}"')
         self.set_status(f'{len(rows)} {phrase} "{needle}"')
+
+    def _match_color(self, line: int, column: int) -> str | None:
+        """The colour this hit carries in the text window, so the tree reads the same way.
+
+        The colour on the matched word wins, since that is what the eye lands on; failing that the line's own status
+        is used, which covers a hit on a line the text leaves black.
+        """
+        spans = self.origins_at(line, column)
+        if spans:
+            return spans[0].value
+        return self.value_of_line.get(line)
 
     def _clear_matches(self, caption: str) -> None:
         self.matches_tree.delete(*self.matches_tree.get_children())
@@ -1648,6 +1718,9 @@ class App(tk.Tk):
         self._syncing = False
         self._hover_after: str | None = None
         self._hover_spans: list[ColorSpan] = []
+        self._match_after: str | None = None
+        self._match_origin: int | None = None
+        self._setting_search = False
 
     def _on_tree_select(self, _event: tk.Event) -> None:
         if self._syncing:  # the selection came from the text window, not from the user
@@ -1692,11 +1765,21 @@ class App(tk.Tk):
             rows.append(f"\u2026 and {remaining} more")
         return "\n".join(rows)
 
+    def _true_position(self, widget: tk.Text, event: tk.Event) -> tuple[int, int] | None:
+        """Pointer coordinates as a (line, column) in current_json, or None when they fall outside the buffer.
+
+        Widget line numbers are current_json line numbers: rendering inserts exactly the joined lines, and folding
+        only elides or appends inside a line, never adding or removing a newline. The one exception is the newline Tk
+        keeps past the last line, which answers with a line one beyond the buffer; it is rejected here so no caller
+        can quote a number that does not exist in the file.
+        """
+        line, column = (int(part) for part in widget.index(f"@{event.x},{event.y}").split("."))
+        return (line, column) if 1 <= line <= len(self.current_json) else None
+
     def _on_text_motion(self, event: tk.Event) -> None:
         """Arm the tooltip when the pointer rests on a coloured item, and drop it as soon as it leaves."""
-        index = self.text.index(f"@{event.x},{event.y}")
-        line, column = (int(part) for part in index.split("."))
-        spans = self.origins_at(line, column) if 1 <= line <= len(self.current_json) else []
+        position = self._true_position(self.text, event)
+        spans = self.origins_at(*position) if position is not None else []
 
         if not spans:
             self._cancel_hover()
@@ -1723,18 +1806,43 @@ class App(tk.Tk):
 
     def _on_text_click(self, event: tk.Event) -> None:
         """A click (or a drag-selection) picks the quoted word to hunt for."""
-        line, column = (int(part) for part in self.text.index(f"@{event.x},{event.y}").split("."))
-        if not 1 <= line <= len(self.current_json):
+        position = self._true_position(self.text, event)
+        if position is None:
             return
+        line, column = position
 
         self._set_current_line(line)
         self._sync_tree_to_line(line)
 
+        key = key_span(self.current_json[line - 1])
+        if key is not None and key[0] <= column < key[1]:
+            self._highlight_value(line)
+        else:
+            self.text.tag_remove("dictvalue", "1.0", "end")
+
         needle = self._selected_word(line, column)
         if needle is None:
-            self._clear_matches("Select a word in quotes to find it elsewhere")
-            return
-        self._show_matches(needle, line)
+            return  # a click off any quoted word leaves the box and its results alone
+        self._search_for(needle, line)
+
+    def _highlight_value(self, line: int) -> bool:
+        """Shade the value belonging to the key on `line`, and say whether there was one.
+
+        A container value runs to its closing bracket, so the whole block is shaded; a scalar covers just the value
+        itself, leaving the key and the punctuation around it alone.
+        """
+        self.text.tag_remove("dictvalue", "1.0", "end")
+        span = value_span(self.current_json[line - 1])
+        if span is None:
+            return False
+
+        start, end = span
+        closing = self.blocks.close_of.get(line)
+        if closing is not None:  # "key": { ... }  - shade down to the closing bracket
+            self.text.tag_add("dictvalue", f"{line}.{start}", f"{closing}.end")
+        else:
+            self.text.tag_add("dictvalue", f"{line}.{start}", f"{line}.{end}")
+        return True
 
     def _selected_word(self, line: int, column: int) -> str | None:
         """An explicit selection wins - double-clicking a word selects it - otherwise the quoted word under the click."""
@@ -1747,15 +1855,16 @@ class App(tk.Tk):
     # ------------------------------------------------------------------------------------------------- events --
 
     def _on_gutter_click(self, event: tk.Event) -> str:
-        line = int(self.gutter.index(f"@{event.x},{event.y}").split(".")[0])
-        self.toggle_fold(line)
+        position = self._true_position(self.gutter, event)
+        if position is not None:
+            self.toggle_fold(position[0])
         return "break"
 
     def _on_text_double_click(self, event: tk.Event) -> str | None:
-        line = int(self.text.index(f"@{event.x},{event.y}").split(".")[0])
-        if not self.blocks.is_foldable(line):
+        position = self._true_position(self.text, event)
+        if position is None or not self.blocks.is_foldable(position[0]):
             return None  # let the default word selection happen
-        self.toggle_fold(line)
+        self.toggle_fold(position[0])
         return "break"
 
     def _on_gutter_wheel(self, event: tk.Event) -> str:

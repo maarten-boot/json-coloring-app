@@ -70,6 +70,8 @@ where each path element is clickable
 and moves the `text window` to that position.
 Make it horizontally scollable when the data is too large.
 
+When selecting a `dict key` in the `text window`
+set the background of the entire `dict value` to `very light gray`.
 
 #### HAVING status fields
 
@@ -111,10 +113,17 @@ unfold the components required to make it visible.
 
 
 Make a `right tree list` at the right side of the `text window`.
-When selecting a word enclosed in quotes in the `text window`,
-find all other lines containing the same text in the json data and show the paths of those items,
+Above the `right tree list` make a search entry.
+
+
+When data is placed in the search entry,
+find all other lines containing the same text in the json data
+and show the paths of those items,
 including the path of the search item,
 as a tree on the `right tree list`.
+
+
+When selecting a word enclosed in quotes in the `text window`, place it in the search entry and execute a search with its value.
 
 
 The selected line in both tree lists should be a light gray,
@@ -140,4 +149,7 @@ Rule_id's are string only and uniq for each <violation_uuid>.
 
 For each item colored remember the position of the origin status json path and when hovering over the colored item show the paths to the origin 'status' field that contributed to its coloring.
 
+
 Make sure to always refer to true line numbers as from `current_json`.
+
+Also apply coloring on the `right tree list`
