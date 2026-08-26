@@ -93,12 +93,13 @@ In `orange` for status `warning`,
 In `red` for status `fail`.
 When selecting a path in the `left tree list`
 expand and show the corresponing item in the `text window` with that path.
+If the left tree is empty minimize the frame holding the `left tree list`.
 
 
 Use a `left tree list` to simplefy the list data.
 Make a search entry above the `left list window`.
+Allow for a 'NOT' button before the search to allow searching for lines not having the search string.
 Limit the data shown in the `left list` based on the search pattern in the search entry.
-If the left tree is empty minimize the frame holding the `left tree list`.
 
 
 When selecting a line in the `text window`

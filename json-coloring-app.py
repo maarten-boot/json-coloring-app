@@ -772,7 +772,16 @@ class App(tk.Tk):
         search = ttk.Frame(parent, padding=(0, 0, 0, 4))
         search.grid(row=0, column=0, columnspan=2, sticky="ew")
         search.columnconfigure(1, weight=1)
-        ttk.Label(search, text="Search").grid(row=0, column=0, padx=(0, 4))
+        self.search_negate = tk.BooleanVar(value=False)
+        # Toolbutton makes a checkbutton look and latch like a button, which is what a NOT switch wants to be.
+        ttk.Checkbutton(
+            search,
+            text="NOT",
+            variable=self.search_negate,
+            style="Toolbutton",
+            width=4,
+            command=self._on_search,
+        ).grid(row=0, column=0, padx=(0, 4))
         self.search_var = tk.StringVar()
         ttk.Entry(search, textvariable=self.search_var).grid(row=0, column=1, sticky="ew")
         ttk.Button(search, text="\u2715", width=3, command=lambda: self.search_var.set("")).grid(row=0, column=2)
@@ -1377,12 +1386,18 @@ class App(tk.Tk):
             self.content.forget(self.left_pane)
 
     def _fill_tree(self) -> int:
-        """Rebuild the status-path tree, keeping only the entries matching the search pattern."""
+        """Rebuild the status-path tree from the entries the search keeps.
+
+        With NOT latched the test is inverted, so the tree lists the paths that do *not* mention the pattern - the
+        way to ask "which components are not npm", say. An empty box filters nothing either way: every line contains
+        the empty string, so negating it would blank the tree rather than mean anything.
+        """
         pattern = self.search_var.get().strip().lower()
+        negate = bool(self.search_negate.get())
         rows = [
             TreeRow(entry.parts, f"{entry.parts[-1]} = {entry.value}  (line {entry.line})", entry.value, entry.line)
             for entry in self.status_paths
-            if entry.parts and (not pattern or pattern in f"{entry.path} = {entry.value}".lower())
+            if entry.parts and (not pattern or (pattern in f"{entry.path} = {entry.value}".lower()) != negate)
         ]
         index = self._fill_path_tree(self.tree, rows)
         self._tree_lines, self._tree_items = index.lines, index.items
@@ -1460,10 +1475,11 @@ class App(tk.Tk):
         shown = self._fill_tree()
         total = len(self.status_paths)
         pattern = self.search_var.get().strip()
-        if pattern:
-            self.set_status(f"Filter {pattern!r}: {shown} of {total} status paths")
-        else:
+        if not pattern:
             self.set_status(f"{total} status paths")
+            return
+        sense = "not matching" if self.search_negate.get() else "matching"
+        self.set_status(f"{shown} of {total} status paths {sense} {pattern!r}")
 
     # ------------------------------------------------------------------------------------------------ folding --
 
