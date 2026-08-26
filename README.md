@@ -2,11 +2,13 @@
 
 ## APP
 
-Claude genrated app from [Spec.md](./Spec.md) using python tkinter.
+Claude genrated app from [Spec.md](./Spec.md)
+
+The app uses python tkinter.
 
 It reads a json file.
 
-When the json contains lines like "status": <value>,
+When the json contains lines like `"status": <value>`,
 where value is one of 'pass', 'warning', 'fail' apply coloring
 and populate a search tree on the left.
 
