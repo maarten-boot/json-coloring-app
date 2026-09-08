@@ -700,6 +700,10 @@ class App(tk.Tk):
         self._build_content()
         self._build_status()
 
+        self.bind("<Control-c>", lambda _event: self.copy_selection())
+        self.bind("<Control-b>", lambda _event: self.copy_block())
+        self.bind("<Control-C>", lambda _event: self.copy_path())  # Ctrl+Shift+C
+        self.bind("<Control-a>", lambda _event: self.select_all())
         self.bind("<Control-o>", lambda _event: self.open_json())
         self.bind("<Control-q>", lambda _event: self.destroy())
 
@@ -718,6 +722,14 @@ class App(tk.Tk):
         files_menu.add_separator()
         files_menu.add_command(label="Quit", accelerator="Ctrl+Q", command=self.destroy)
         menubar.add_cascade(label="Files", menu=files_menu)
+
+        edit_menu = tk.Menu(menubar, tearoff=False)
+        edit_menu.add_command(label="Copy", accelerator="Ctrl+C", command=self.copy_selection)
+        edit_menu.add_command(label="Copy Block as JSON", accelerator="Ctrl+B", command=self.copy_block)
+        edit_menu.add_command(label="Copy Path", accelerator="Ctrl+Shift+C", command=self.copy_path)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Select All", accelerator="Ctrl+A", command=self.select_all)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
 
         view_menu = tk.Menu(menubar, tearoff=False)
         view_menu.add_command(label="Collapse All", command=self.collapse_all)
@@ -913,6 +925,15 @@ class App(tk.Tk):
         self.text.bind("<Double-Button-1>", self._on_text_double_click)
         self.text.bind("<ButtonRelease-1>", self._on_text_click)
         self.tooltip = Tooltip(self)
+        self.context_menu = tk.Menu(self, tearoff=False)
+        self.context_menu.add_command(label="Copy", command=self.copy_selection)
+        self.context_menu.add_command(label="Copy Block as JSON", command=self.copy_block)
+        self.context_menu.add_command(label="Copy Path", command=self.copy_path)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Select All", command=self.select_all)
+        for sequence in ("<Button-3>", "<Button-2>"):  # right button, and the middle one on some window managers
+            self.text.bind(sequence, self._on_context_menu)
+
         self.text.bind("<Motion>", self._on_text_motion)
         self.text.bind("<Leave>", lambda _event: self._cancel_hover())
         for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
@@ -1783,6 +1804,99 @@ class App(tk.Tk):
             rows.append(f"\u2026 and {remaining} more")
         return "\n".join(rows)
 
+    def selection_bounds(self) -> tuple[int, int, int, int] | None:
+        """The selection as (first line, first column, last line, last column), or None when nothing is selected."""
+        if not self.text.tag_ranges("sel"):
+            return None
+        first_line, first_column = (int(part) for part in self.text.index("sel.first").split("."))
+        last_line, last_column = (int(part) for part in self.text.index("sel.last").split("."))
+        return first_line, first_column, last_line, last_column
+
+    def selected_text(self) -> str | None:
+        """The selection, rebuilt from current_json.
+
+        Reading the buffer rather than the widget keeps fold marks out of the clipboard and returns the real content
+        of any collapsed block the selection spans - what a folded region hides is still part of the document.
+        """
+        bounds = self.selection_bounds()
+        if bounds is None:
+            return None
+
+        first_line, first_column, last_line, last_column = bounds
+        if first_line == last_line:
+            return self.current_json[first_line - 1][first_column:last_column]
+
+        pieces = [self.current_json[first_line - 1][first_column:]]
+        pieces += self.current_json[first_line : last_line - 1]
+        pieces.append(self.current_json[last_line - 1][:last_column])
+        return "\n".join(pieces)
+
+    def block_json(self, line: int) -> str | None:
+        """The value of the block around `line`, dedented so it stands alone as valid JSON.
+
+        A member line gives its value, not the "key": part, and the trailing comma goes: the point is text another
+        tool will accept. Indentation is measured from the closing bracket, which sits at the block's own level.
+        """
+        opened = self.blocks.opening_line(line)
+        if opened is None:
+            opened = self.blocks.enclosing.get(line, 0)
+        closed = self.blocks.close_of.get(opened)
+        if not opened or closed is None:
+            return None
+
+        head = self.current_json[opened - 1]
+        span = value_span(head)
+        closing = self.current_json[closed - 1]
+        indent = len(closing) - len(closing.lstrip())
+
+        rows = [head[span[0] :] if span is not None else head[indent:]]
+        rows += [self.current_json[number - 1][indent:] for number in range(opened + 1, closed + 1)]
+        return "\n".join(rows).rstrip().rstrip(",")
+
+    def _to_clipboard(self, text: str, what: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        lines = text.count("\n") + 1
+        self.set_status(f"Copied {what} \u2014 {lines} line{'' if lines == 1 else 's'}, {len(text):,} characters")
+
+    def copy_selection(self) -> str:
+        """Copy the selection, or the current line when there is none."""
+        text = self.selected_text()
+        if text is None:
+            line = self.current_line
+            if line is None:
+                self.set_status("Nothing selected")
+                return "break"
+            text = self.current_json[line - 1]
+            self._to_clipboard(text, f"line {line}")
+            return "break"
+        self._to_clipboard(text, "selection")
+        return "break"
+
+    def copy_block(self) -> str:
+        """Copy the enclosing block as standalone JSON."""
+        line = self.current_line
+        text = self.block_json(line) if line is not None else None
+        if text is None:
+            self.set_status("No block here to copy")
+            return "break"
+        self._to_clipboard(text, "block")
+        return "break"
+
+    def copy_path(self) -> str:
+        """Copy the jq path of the current line, ready to paste into a jq filter."""
+        line = self.current_line
+        path = self.paths.get(line) if line is not None else None
+        if path is None:
+            self.set_status("No path for this line")
+            return "break"
+        self._to_clipboard(path.text, "path")
+        return "break"
+
+    def select_all(self) -> str:
+        self.text.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
     def _true_position(self, widget: tk.Text, event: tk.Event) -> tuple[int, int] | None:
         """Pointer coordinates as a (line, column) in current_json, or None when they fall outside the buffer.
 
@@ -1871,6 +1985,14 @@ class App(tk.Tk):
         return quoted_token_at(self.current_json[line - 1], column)
 
     # ------------------------------------------------------------------------------------------------- events --
+
+    def _on_context_menu(self, event: tk.Event) -> str:
+        """Point the current line at wherever the menu was opened, so Copy Block acts on what was right-clicked."""
+        position = self._true_position(self.text, event)
+        if position is not None and self.selection_bounds() is None:
+            self._set_current_line(position[0])
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
 
     def _on_gutter_click(self, event: tk.Event) -> str:
         position = self._true_position(self.gutter, event)

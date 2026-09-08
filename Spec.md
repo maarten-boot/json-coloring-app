@@ -73,6 +73,15 @@ Make it horizontally scollable when the data is too large.
 When selecting a `dict key` in the `text window`
 set the background of the entire `dict value` to `very light gray`.
 
+
+In the `menu line` add an Edit item to copy data out to other tools.
+Copy the current selection, or the current line when nothing is selected.
+Copy the enclosing block as standalone json, without its dict `key` and dedented so another tool accepts it.
+Copy the `json path` of the current line.
+Offer the same items on a right click in the `text window`.
+Copy from `current_json`, so fold marks never end up on the clipboard
+and a collapsed block still yields its real content.
+
 #### HAVING status fields
 
 In the `text window`:
