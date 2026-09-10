@@ -427,6 +427,11 @@ def _base_segment(part: str) -> str:
     return part.split("[", 1)[0]
 
 
+def inside_string(line: str, column: int) -> bool:
+    """True when `column` falls inside a quoted string, where a bracket is text rather than structure."""
+    return any(start <= column <= end for start, end, _ in quoted_spans(line))
+
+
 def value_span(line: str) -> tuple[int, int] | None:
     """Column range of a dict member's value, trailing comma excluded, or None when the line holds no member."""
     match = VALUE_RE.match(line)
@@ -1946,34 +1951,64 @@ class App(tk.Tk):
         self._set_current_line(line)
         self._sync_tree_to_line(line)
 
-        key = key_span(self.current_json[line - 1])
-        if key is not None and key[0] <= column < key[1]:
-            self._highlight_value(line)
-        else:
-            self.text.tag_remove("dictvalue", "1.0", "end")
+        self._highlight_at(line, column)
 
         needle = self._selected_word(line, column)
         if needle is None:
             return  # a click off any quoted word leaves the box and its results alone
         self._search_for(needle, line)
 
-    def _highlight_value(self, line: int) -> bool:
-        """Shade the value belonging to the key on `line`, and say whether there was one.
+    def _highlight_at(self, line: int, column: int) -> bool:
+        """Shade whatever the click identifies: a key's value, or the block a bracket belongs to.
+
+        Clicking a bracket shades the same extent as clicking the key above it, so either end of a block, and either
+        way of pointing at it, gives the same answer.
+        """
+        self.text.tag_remove("dictvalue", "1.0", "end")
+        body = self.current_json[line - 1]
+
+        key = key_span(body)
+        if key is not None and key[0] <= column < key[1]:
+            return self._shade_value(line)
+        if column < len(body) and body[column] in OPENERS + CLOSERS and not inside_string(body, column):
+            return self._shade_bracket(line, column)
+        return False
+
+    def _shade_value(self, line: int) -> bool:
+        """Shade the value belonging to the key on `line`.
 
         A container value runs to its closing bracket, so the whole block is shaded; a scalar covers just the value
         itself, leaving the key and the punctuation around it alone.
         """
-        self.text.tag_remove("dictvalue", "1.0", "end")
         span = value_span(self.current_json[line - 1])
         if span is None:
             return False
 
-        start, end = span
         closing = self.blocks.close_of.get(line)
         if closing is not None:  # "key": { ... }  - shade down to the closing bracket
-            self.text.tag_add("dictvalue", f"{line}.{start}", f"{closing}.end")
+            self.text.tag_add("dictvalue", f"{line}.{span[0]}", f"{closing}.end")
         else:
-            self.text.tag_add("dictvalue", f"{line}.{start}", f"{line}.{end}")
+            self.text.tag_add("dictvalue", f"{line}.{span[0]}", f"{line}.{span[1]}")
+        return True
+
+    def _shade_bracket(self, line: int, column: int) -> bool:
+        """Shade the block whose bracket sits at `column`, from its opening bracket to its closing one.
+
+        Either bracket of a pair selects the whole block. A container jq kept inline because it is empty - "{}" or
+        "[]" - has no block to speak of, so just the pair itself is shaded.
+        """
+        opened = self.blocks.opening_line(line)
+        if opened is None:  # an empty container, both brackets on this line
+            body = self.current_json[line - 1]
+            start = column if body[column] in OPENERS else column - 1
+            if 0 <= start and body[start : start + 2] in ("{}", "[]"):
+                self.text.tag_add("dictvalue", f"{line}.{start}", f"{line}.{start + 2}")
+                return True
+            return False
+
+        closing = self.blocks.close_of[opened]
+        head = self.current_json[opened - 1]
+        self.text.tag_add("dictvalue", f"{opened}.{len(head.rstrip()) - 1}", f"{closing}.end")
         return True
 
     def _selected_word(self, line: int, column: int) -> str | None:
