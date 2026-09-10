@@ -1077,7 +1077,7 @@ class App(tk.Tk):
         self.set_status(self.recent.error or "Ready \u2014 Files \u203a Open to load a JSON file")
 
     def _build_menu(self) -> None:
-        menubar = tk.Menu(self)
+        menubar = tk.Menu(self, tearoff=False)
 
         files_menu = tk.Menu(menubar, tearoff=False)
         files_menu.add_command(label="Open\u2026", accelerator="Ctrl+O", command=self.open_json)
@@ -1343,7 +1343,8 @@ class App(tk.Tk):
     def _update_counters(self) -> None:
         tally = ", ".join(f"{len(self.status_lines.get(value, []))} {value}" for value in STATUS_COLORS)
         hits = sum(len(numbers) for numbers in self.status_lines.values())
-        where = f"line {self.current_line} of {len(self.current_json)}" if self.current_line else "no line selected"
+        total = len(self.current_json)
+        where = f"line {self.current_line} of {total}" if self.current_line else f"{total} lines"
         self._counters.set(f"{where} \u2022 {hits} status ({tally}) \u2022 {len(self.folded)} folded")
 
     def _update_title(self) -> None:
@@ -1416,10 +1417,11 @@ class App(tk.Tk):
         self.set_status(f"Opened {path} \u2014 {self._load_report(collapsed)}")
 
     def open_argument(self, path: Path) -> None:
-        """Open the file named by --file, refusing anything that is not a .json."""
+        """Open the file named by --file, refusing anything jy does not read."""
         if not is_supported_file(path):
-            messagebox.showwarning(APP_NAME, f"Ignoring {path}:\n\nonly .json files are accepted.")
-            self.set_status(f"Ignored {path.name}: not a .json file")
+            accepted = ", ".join(JSON_SUFFIXES + YAML_SUFFIXES)
+            messagebox.showwarning(APP_NAME, f"Ignoring {path}:\n\nonly {accepted} files are accepted.")
+            self.set_status(f"Ignored {path.name}: not one of {accepted}")
             return
         self.open_path(path)
 

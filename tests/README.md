@@ -12,9 +12,8 @@ make check                  # formatting, lint, then the display-free tests
 `make help` lists every target. All of it works without make too: `pytest`,
 `pytest -m "not gui"`, `xvfb-run -a pytest`.
 
-`conftest.py` finds `jy.py` itself, so the layout is up to you: the test files can sit in
-`tests/` or flat beside `jy.py`, and the `gui` marker is registered in `conftest.py` rather
-than only in `pytest.ini` — so it works even when that file is not picked up.
+`pytest` must run from the directory holding `jy.py`; `conftest.py` puts that directory
+on the path itself, so no install step is needed.
 
 ## What is where
 
