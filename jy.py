@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""A Tkinter JSON viewer with a status-path list, folding, and status colouring.
+"""jy - a Tkinter viewer for JSON and YAML, with a status-path list, folding, and status colouring.
 
 Layout (top to bottom):
     * menu bar      - Files / View / Help
     * content frame - status-path tree left, breadcrumb + fold gutter + text window centre, word matches right
     * status line   - message on the left, counters on the right
 
-Opening a file formats it the way `jq --indent 2 -r .` would, in pure Python. The output is kept in
-`current_json`, every line
+A JSON file is formatted the way `jq --indent 2 -r .` would, in pure Python; a YAML file keeps its own text so
+comments and quoting survive. Either way the result is kept in `current_json`, every line
 carrying a "status" key is indexed in `status_lines`, its jq path is recorded in `status_paths`, and every
 non-empty {...} / [...] pair becomes a foldable block. Containers named by AUTO_COLLAPSE_KEYS start folded.
 
@@ -24,15 +24,19 @@ import json
 import re
 import sys
 import tkinter as tk
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import NamedTuple
 
-APP_NAME = "JSON Viewer"
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
+
+APP_NAME = "jy"
 # L: the last opened files live in ~/.<script name>/recent.txt, newest first.
 RECENT_LIMIT = 25
 RECENT_FILE = "recent.txt"
-FALLBACK_SLUG = "json_viewer"
+FALLBACK_SLUG = "jy"
 # O: past this size the load runs behind a progress window, reporting each stage below.
 LARGE_FILE_BYTES = 1_000_000
 PROCESSING_STEPS = (
@@ -68,6 +72,10 @@ HOVER_DELAY_MS = 400
 MATCH_SEARCH_DELAY_MS = 250
 # A hover names every status that contributed; past this many the rest are summarised.
 MAX_HOVER_ORIGINS = 6
+# How many places the history bar remembers, and how a $ref is drawn.
+HISTORY_LIMIT = 50
+REF_COLOR = LINK_COLOR
+DEAD_REF_COLOR = "#8a6d3b"
 TOOLTIP_BG = "#ffffe0"
 
 # Lowest priority first, so a key leading to both a pass and a fail ends up red. Tk's "orange" (#FFA500) is light
@@ -103,8 +111,9 @@ UNDERLINE_REFERENCES = False
 # A list holding a coloured reference stays open, so rule H's default folds cannot hide it. Set False to let H win.
 KEEP_MARKED_LISTS_OPEN = True
 
-# Matches:  "status": "pass",  /  "status": 200  /  "status": {
-STATUS_RE = re.compile(r'^\s*"status"\s*:\s*(?P<value>.*?)\s*,?\s*$')
+STATUS_KEY = "status"
+# A $ref pointing inside the same document becomes a link; anything else is shown but not followed.
+REF_KEY = "$ref"
 # Splits an object member into its key and whatever follows the colon.
 MEMBER_RE = re.compile(r'^"(?P<key>(?:[^"\\]|\\.)*)"\s*:\s*(?P<rest>.*)$')
 # A dict member split into its key, its value and any trailing comma, used to shade a value on demand.
@@ -121,12 +130,12 @@ CANDIDATE_RE = re.compile(r"[\w-]+")
 SIMPLE_TOKEN_RE = re.compile(r"^[\w-]+$")
 
 
-class JsonError(RuntimeError):
-    """The file could not be read, or does not hold valid JSON."""
+class DocumentError(RuntimeError):
+    """The file could not be read, or does not hold a valid document."""
 
 
 def app_directory() -> Path:
-    """The app's hidden directory in HOME, named after the script: json_viewer.py -> ~/.json_viewer."""
+    """The app's hidden directory in HOME, named after the script: jy.py -> ~/.jy."""
     slug = Path(sys.argv[0]).stem or FALLBACK_SLUG
     return Path.home() / f".{slug}"
 
@@ -186,9 +195,13 @@ class RecentFiles:
         self._write()
 
 
-def is_json_file(path: Path) -> bool:
-    """A file is taken as JSON on its extension alone, which is all --file promises to check."""
-    return path.suffix.lower() == ".json"
+JSON_SUFFIXES = (".json",)
+YAML_SUFFIXES = (".yaml", ".yml")
+
+
+def is_supported_file(path: Path) -> bool:
+    """A file is taken on its extension alone, which is all --file promises to check."""
+    return path.suffix.lower() in JSON_SUFFIXES + YAML_SUFFIXES
 
 
 def file_size(path: Path) -> int:
@@ -228,6 +241,54 @@ def shorten_home(path: Path) -> str:
         return f"~/{path.relative_to(Path.home())}"
     except ValueError:
         return str(path)
+
+
+class History:
+    """Where the reader has been, with a cursor like a browser's.
+
+    Entries are paths, not line numbers: a path still means something after the document is reloaded or re-rendered,
+    and following a $ref can land far from where the line numbers were when the entry was made.
+    """
+
+    def __init__(self, limit: int = HISTORY_LIMIT) -> None:
+        self.entries: list[tuple[tuple[str, ...], str]] = []
+        self.index = -1
+        self.limit = limit
+
+    def visit(self, parts: tuple[str, ...], label: str) -> None:
+        """Record a new location, dropping anything that was ahead of the cursor."""
+        if self.entries and self.entries[self.index][0] == parts:
+            return  # already standing there
+        del self.entries[self.index + 1 :]
+        self.entries.append((parts, label))
+        if len(self.entries) > self.limit:
+            self.entries.pop(0)
+        self.index = len(self.entries) - 1
+
+    def back(self) -> tuple[str, ...] | None:
+        if self.index <= 0:
+            return None
+        self.index -= 1
+        return self.entries[self.index][0]
+
+    def forward(self) -> tuple[str, ...] | None:
+        if self.index < 0 or self.index >= len(self.entries) - 1:
+            return None
+        self.index += 1
+        return self.entries[self.index][0]
+
+    def go(self, index: int) -> tuple[str, ...] | None:
+        if 0 <= index < len(self.entries):
+            self.index = index
+            return self.entries[self.index][0]
+        return None
+
+    def labels(self) -> list[str]:
+        return [label for _parts, label in self.entries]
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self.index = -1
 
 
 class Tooltip:
@@ -364,62 +425,237 @@ def format_json(text: str) -> list[str]:
     kept inline as {} / []. ensure_ascii=False leaves non-ASCII readable the way jq writes it, and a document that is
     just a string is printed raw, which is what -r means.
     """
+    return build_document(parse_json(text)).lines
+
+
+# Text that says how a value is written, or that it is empty, rather than what it is: not worth searching for.
+UNSEARCHABLE = ("|", "|-", "|+", ">", ">-", ">+", "{", "}", "[", "]", "{}", "[]")
+
+
+def _plain_word(text: str) -> str | None:
+    """A value as a search term, or None when it is only YAML punctuation."""
+    word = text.strip().strip("\"'").strip()
+    if not word or word in UNSEARCHABLE or word[0] in "&*":
+        return None
+    return word
+
+
+def _yaml_key_span(line: str, column: int) -> tuple[int, int]:
+    """Columns of the key token written at `column`, quoted or bare."""
+    if column < len(line) and line[column] in "\"'":
+        quote = line[column]
+        end = line.find(quote, column + 1)
+        return (column, end + 1) if end > 0 else (column, len(line))
+    end = line.find(":", column)
+    return column, len(line[column:end].rstrip()) + column if end > 0 else len(line)
+
+
+def _lc_position(container: object, index: object, kind: str) -> tuple[int, int] | None:
+    """Where a key, value or element sits, or None when this part of the text does not hold it.
+
+    Keys pulled in by a merge key (`<<: *anchor`) are reported by ruamel as members but have no position here: they
+    live at the anchor. Asking for their position raises, and the honest answer is that they are not on screen.
+    """
+    marks = getattr(container, "lc", None)
+    if marks is None:
+        return None
     try:
-        data = json.loads(text, parse_constant=_reject_constant)
+        return getattr(marks, kind)(index)
+    except (KeyError, IndexError, AttributeError, TypeError):
+        return None
+
+
+def _yaml_value_end(line: str, start: int) -> int:
+    """Where a value written on one line ends: before any trailing comment, and never inside a quoted string."""
+    quote = ""
+    for column in range(start, len(line)):
+        char = line[column]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and column > start and line[column - 1] in " \t":
+            return len(line[:column].rstrip())
+    return len(line.rstrip())
+
+
+def _scalar_extent(lines: list[str], line: int) -> int:
+    """The last line a scalar written at `line` occupies.
+
+    A block scalar ("description: |-") keeps its text on the following lines, indented deeper than its own key.
+    Anything indented past that key belongs to it, blank lines included when more text follows; the first line back
+    at or left of the key ends it. For an ordinary one-line scalar this returns the line itself.
+    """
+    body = lines[line - 1]
+    indent = len(body) - len(body.lstrip())
+    last = line
+    for number in range(line + 1, len(lines) + 1):
+        row = lines[number - 1]
+        if not row.strip():
+            continue  # a blank line inside block text does not end it
+        if len(row) - len(row.lstrip()) <= indent:
+            break
+        last = number
+    return last
+
+
+def build_yaml_document(text: str) -> Document:
+    """Structure a YAML file without re-rendering it.
+
+    The file's own lines are what the window shows, so comments, quoting, anchors and blank lines all survive
+    untouched; ruamel supplies the position of every key and value, which is all the structure the window needs.
+    Only the first document of a multi-document file is structured - the rest is still displayed. Flow style
+    ("{a: 1, b: 2}") puts several members on one line; since everything here is keyed by line, only the first of
+    them is indexed, and a status hidden inside a flow mapping is not found.
+    """
+    yaml = YAML()
+    try:
+        loaded = list(yaml.load_all(text))
+    except YAMLError as exc:  # every ruamel parse failure derives from this
+        raise DocumentError(f"Not valid YAML: {exc}") from None
+
+    document = Document(lines=text.splitlines() or [""], style="yaml")
+    if len(loaded) > 1:
+        document.warning = f"{len(loaded)} documents in this file; only the first is navigable"
+    data = loaded[0] if loaded else None
+
+    containers: list[tuple[int, int, int]] = []  # (opening line, closing line, depth), outermost first
+    seen: set[int] = set()
+
+    def visit(
+        value: object,
+        parts: tuple[str, ...],
+        path: str,
+        prefix: str,
+        key: str | None,
+        line: int,
+        depth: int,
+        root: bool = False,
+    ) -> Node:
+        """Record the value that starts on `line`; return its node with the last line it reaches.
+
+        The root is a special case: in YAML it owns no line of its own - the first line of the file already belongs
+        to a member or a comment - so it claims neither a path nor a fold, and only its children are recorded.
+        """
+        kind = "mapping" if isinstance(value, dict) else "sequence" if isinstance(value, list) else "scalar"
+        alias = kind != "scalar" and id(value) in seen  # an anchor reused: the text here is just *name
+        node = Node(kind if not alias else "scalar", parts, path, key, line, value=value if kind == "scalar" else None)
+        if not root:
+            document.nodes.setdefault(line, node)
+            document.paths.setdefault(line, JsonPath(path, parts))
+            document.line_of_parts.setdefault(parts, line)
+
+        if kind == "scalar" or alias or not value:
+            if not root:  # block text ("|-", ">") runs past its key and folds like any other block
+                extent = _scalar_extent(document.lines, line)
+                if extent > line:
+                    node.close_line = extent
+                    document.blocks.close_of[line] = extent
+                    document.blocks.open_of.setdefault(extent, line)
+                    containers.append((line, extent, depth))
+            return node
+
+        seen.add(id(value))
+        last = line
+        members = value.items() if isinstance(value, dict) else enumerate(value)
+        for index, item in members:
+            if isinstance(value, dict):
+                child_key = str(index)
+                position = _lc_position(value, index, "key")
+                if position is None:  # merged in from an anchor: not written at this place in the file
+                    continue
+                child_parts = (*parts, child_key)
+                child_path = _path_text(prefix, child_key)
+                child_line = position[0] + 1
+                document.key_spans[child_line] = _yaml_key_span(document.lines[child_line - 1], position[1])
+                where = _lc_position(value, index, "value")
+                if where and where[0] == position[0]:  # "key: value" on one line
+                    body = document.lines[child_line - 1]
+                    document.value_spans[child_line] = (where[1], _yaml_value_end(body, where[1]))
+                else:  # a block that starts underneath its key
+                    tail = len(document.lines[child_line - 1].rstrip())
+                    document.value_spans[child_line] = (tail, tail)
+                child = visit(item, child_parts, child_path, child_path, child_key, child_line, depth + 1)
+            else:
+                position = _lc_position(value, index, "item")
+                child_parts = _element_parts(parts, index)
+                child_path = f"{prefix}[{index}]"
+                child_line = (position[0] + 1) if position else last
+                child = visit(item, child_parts, child_path, child_path, None, child_line, depth + 1)
+            node.children.append(child)
+            last = max(last, child.close_line or child.line)
+
+        if last > line and not root:
+            node.close_line = last
+            document.blocks.close_of[line] = last
+            # Children are recorded first, so setdefault keeps the innermost block for a shared last line.
+            document.blocks.open_of.setdefault(last, line)
+            containers.append((line, last, depth))
+        document.scalar_items[line] = [child.line for child in node.children if child.is_scalar]
+        return node
+
+    document.root = visit(data, (), ".", "", None, 1, 0, root=True)
+    document.line_of_parts[()] = 1
+
+    # Which block holds each line: assign outermost first so a deeper container overwrites its parent.
+    for line in range(1, len(document.lines) + 1):
+        document.blocks.enclosing[line] = 0
+    for opened, closed, _depth in sorted(containers, key=lambda entry: entry[2]):
+        for line in range(opened + 1, closed + 1):
+            document.blocks.enclosing[line] = opened
+    index_refs(document)
+    return document
+
+
+def parse_json(text: str) -> object:
+    """Parse JSON strictly: NaN and Infinity are not JSON, whatever Python's decoder allows."""
+    try:
+        return json.loads(text, parse_constant=_reject_constant)
     except ValueError as exc:
-        raise JsonError(f"Not valid JSON: {exc}") from None
-
-    if isinstance(data, str):  # `jq -r .` unwraps a top-level string
-        return data.splitlines() or [""]
-    return json.dumps(data, indent=JSON_INDENT, ensure_ascii=False).splitlines()
+        raise DocumentError(f"Not valid JSON: {exc}") from None
 
 
-def load_json(path: Path) -> list[str]:
-    """Read `path` and return it formatted, one line per entry."""
+def load_document(path: Path) -> Document:
+    """Read `path` and structure it according to its extension.
+
+    JSON is rendered from its parsed form the way jq would; YAML keeps the file's own text and is only indexed.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise JsonError(f"Could not read {path.name}: {exc}") from None
+        raise DocumentError(f"Could not read {path.name}: {exc}") from None
     except UnicodeDecodeError as exc:
-        raise JsonError(f"{path.name} is not UTF-8 text: {exc}") from None
-    return format_json(text)
+        raise DocumentError(f"{path.name} is not UTF-8 text: {exc}") from None
+
+    if path.suffix.lower() in YAML_SUFFIXES:
+        return build_yaml_document(text)
+    return build_document(parse_json(text))
 
 
-def collect_status_lines(lines: list[str]) -> dict[str, list[int]]:
-    """Map every distinct "status" value to the 1-based lines it appears on.
+def collect_status_lines(document: Document) -> dict[str, list[int]]:
+    """Map every distinct value of a "status" member to the 1-based lines it appears on.
 
-    Line numbers are 1-based so they can be handed straight to the Text widget, whose indices read "<line>.<column>".
+    Read from the parsed tree rather than matched against the text, so the same rule serves JSON and YAML alike.
     """
     found: dict[str, list[int]] = {}
-    for number, line in enumerate(lines, start=1):
-        match = STATUS_RE.match(line)
-        if match is not None:
-            found.setdefault(_status_value(match.group("value")), []).append(number)
+    for line, node in sorted(document.nodes.items()):
+        if node.key == STATUS_KEY:
+            found.setdefault(_status_text(node), []).append(line)
     return found
 
 
-def _status_value(token: str) -> str:
-    """Turn the raw text after the colon into a dictionary key."""
+def _status_text(node: Node) -> str:
+    """How a status value is named, spelled the way it appears in JSON."""
+    if node.kind in ("mapping", "sequence"):
+        opener, empty = ("{", "{}") if node.kind == "mapping" else ("[", "[]")
+        return opener if node.children else empty
+    if isinstance(node.value, str):
+        return node.value
     try:
-        value = json.loads(token)
-    except ValueError:
-        return token  # a nested object/array opener ("{" or "["), or anything unexpected
-
-    if isinstance(value, str):
-        return value  # "pass" -> pass, with escapes resolved
-    return json.dumps(value)  # null / true / false / 200, JSON-spelled
-
-
-def key_span(line: str) -> tuple[int, int] | None:
-    """Column range of the quoted key at the head of `line`, or None on a line that opens no member.
-
-    Array elements ("{") and the document root have no key, so they contribute nothing to a breadcrumb.
-    """
-    match = KEY_RE.match(line)
-    if match is None:
-        return None
-    start = len(match.group("indent"))
-    return start, start + len(match.group("key"))
+        return json.dumps(node.value)
+    except TypeError:  # a YAML scalar json cannot spell, a date say
+        return str(node.value)
 
 
 def _base_segment(part: str) -> str:
@@ -430,23 +666,6 @@ def _base_segment(part: str) -> str:
 def inside_string(line: str, column: int) -> bool:
     """True when `column` falls inside a quoted string, where a bracket is text rather than structure."""
     return any(start <= column <= end for start, end, _ in quoted_spans(line))
-
-
-def value_span(line: str) -> tuple[int, int] | None:
-    """Column range of a dict member's value, trailing comma excluded, or None when the line holds no member."""
-    match = VALUE_RE.match(line)
-    if match is None or not match.group("value"):
-        return None
-    start = len(match.group("lead"))
-    return start, start + len(match.group("value"))
-
-
-def member_key(line: str) -> str | None:
-    """The decoded key of the member on `line`, or None for array elements and bare brackets."""
-    match = MEMBER_RE.match(line.strip())
-    if match is None:
-        return None
-    return json.loads(f'"{match.group("key")}"')
 
 
 def quoted_spans(line: str) -> list[tuple[int, int, str]]:
@@ -480,29 +699,6 @@ def quoted_token_at(line: str, column: int) -> str | None:
     return None
 
 
-def is_scalar_item(line: str) -> bool:
-    """True when `line` holds an item whose value is neither a list nor a dict.
-
-    jq puts a container's opening bracket at the end of its line ("key": { / "key": [) and keeps an empty container
-    inline ("key": {} / "key": []), so the tail of the line is enough to tell a scalar item from a container one.
-    A bare closing bracket is not an item at all.
-    """
-    body = line.strip().rstrip(",").rstrip()
-    if not body or body[0] in CLOSERS:
-        return False
-    return not body.endswith(("{", "[", "{}", "[]"))
-
-
-class _Frame:
-    """One open container while walking the buffer: how to name the children inside it."""
-
-    def __init__(self, kind: str, prefix: str, parts: tuple[str, ...]) -> None:
-        self.kind = kind  # "object" or "array"
-        self.prefix = prefix
-        self.parts = parts
-        self.index = 0  # next array position
-
-
 def _element_parts(parts: tuple[str, ...], index: int) -> tuple[str, ...]:
     """Segments for an array element: the index rides along with the key that named the array.
 
@@ -512,50 +708,6 @@ def _element_parts(parts: tuple[str, ...], index: int) -> tuple[str, ...]:
     if not parts:
         return (f"[{index}]",)
     return (*parts[:-1], f"{parts[-1]}[{index}]")
-
-
-def json_paths(lines: list[str]) -> dict[int, JsonPath]:
-    """Map each 1-based line to the jq path of the value it introduces.
-
-    jq's output carries no paths, so they are rebuilt by walking the pretty-printed lines and keeping a stack of open
-    containers: object members contribute their key, array elements contribute a running index.
-    """
-    paths: dict[int, JsonPath] = {}
-    frames: list[_Frame] = []
-
-    for number, raw in enumerate(lines, start=1):
-        content = raw.strip()
-        if not content:
-            continue
-
-        if content[0] in CLOSERS:  # "}", "],", ... - a container ends, nothing new is named
-            if frames:
-                frames.pop()
-            continue
-
-        body = content.rstrip(",").rstrip()
-        parent = frames[-1] if frames else None
-
-        if parent is None:  # the document root
-            path, parts, rest = ".", (), body
-        elif parent.kind == "array":
-            path, parts, rest = f"{parent.prefix}[{parent.index}]", _element_parts(parent.parts, parent.index), body
-            parent.index += 1
-        else:
-            member = MEMBER_RE.match(body)
-            if member is None:  # not a member line: leave it under its parent
-                paths[number] = JsonPath(parent.prefix or ".", parent.parts)
-                continue
-            key = json.loads(f'"{member.group("key")}"')
-            path = f"{parent.prefix}.{key}" if PLAIN_KEY_RE.match(key) else f'{parent.prefix}["{key}"]'
-            parts, rest = (*parent.parts, key), member.group("rest")
-
-        paths[number] = JsonPath(path, parts)
-        if rest in ("{", "["):  # an empty "{}" / "[]" stays on one line and opens nothing
-            kind = "object" if rest == "{" else "array"
-            frames.append(_Frame(kind, "" if parent is None else path, parts))
-
-    return paths
 
 
 def collect_status_paths(paths: dict[int, JsonPath], status_lines: dict[str, list[int]]) -> list[StatusEntry]:
@@ -574,34 +726,50 @@ def collect_status_paths(paths: dict[int, JsonPath], status_lines: dict[str, lis
     return sorted(entries)
 
 
-class Blocks:
-    """The {...} and [...] structure of a jq-formatted buffer.
+@dataclass
+class Node:
+    """One value in the document, and where it landed in the rendered text."""
 
-    close_of    -- opening line -> closing line, for pairs that span more than one line
+    kind: str  # "mapping", "sequence" or "scalar"
+    parts: tuple[str, ...]
+    path: str
+    key: str | None  # None for array elements and the root
+    line: int
+    close_line: int | None = None  # None for scalars and for containers kept on one line
+    value: object = None  # scalars only
+    children: list[Node] = field(default_factory=list)
+
+    @property
+    def is_scalar(self) -> bool:
+        return self.kind == "scalar"
+
+    def child(self, key: str) -> Node | None:
+        for node in self.children:
+            if node.key == key:
+                return node
+        return None
+
+
+class Blocks:
+    """The block structure of a rendered document.
+
+    close_of    -- opening line -> closing line, for containers that span more than one line
     open_of     -- closing line -> opening line
     enclosing   -- any line -> the opening line of the innermost block containing it (0 at top level)
+
+    Built by the renderer rather than recovered by scanning the text, so a bracket inside a string or an empty
+    container needs no special handling: neither ever reaches this.
     """
 
-    def __init__(self, lines: list[str]) -> None:
-        self.close_of: dict[int, int] = {}
-        self.open_of: dict[int, int] = {}
-        self.enclosing: dict[int, int] = {}
-        self._scan(lines)
-
-    def _scan(self, lines: list[str]) -> None:
-        stack: list[int] = []
-        for number, line in enumerate(lines, start=1):
-            # Recorded before the line's own brackets, so an opening line belongs to its parent block.
-            self.enclosing[number] = stack[-1] if stack else 0
-            for bracket in _brackets(line):
-                if bracket in OPENERS:
-                    stack.append(number)
-                elif stack:
-                    opened = stack.pop()
-                    # jq keeps an empty container on one line ("{}"), which leaves nothing to fold.
-                    if opened != number:
-                        self.close_of[opened] = number
-                        self.open_of[number] = opened
+    def __init__(
+        self,
+        close_of: dict[int, int] | None = None,
+        open_of: dict[int, int] | None = None,
+        enclosing: dict[int, int] | None = None,
+    ) -> None:
+        self.close_of = close_of or {}
+        self.open_of = open_of or {}
+        self.enclosing = enclosing or {}
 
     def is_foldable(self, line: int) -> bool:
         return line in self.close_of or line in self.open_of
@@ -630,34 +798,221 @@ class Blocks:
         return list(reversed(chain))
 
 
-def _brackets(line: str) -> list[str]:
-    """The structural brackets on a line, skipping anything inside a JSON string.
+@dataclass
+class Ref:
+    """A $ref written somewhere in the document, and where it points."""
 
-    Most lines in a formatted document are plain scalar members with no bracket at all, so they are rejected by a
-    single scan before paying for the character loop.
+    line: int
+    span: tuple[int, int]  # columns of the pointer on that line
+    pointer: str
+    target_line: int | None = None
+    target_parts: tuple[str, ...] | None = None
+
+    @property
+    def internal(self) -> bool:
+        return self.pointer.startswith("#")
+
+    @property
+    def resolved(self) -> bool:
+        return self.target_line is not None
+
+
+@dataclass
+class Document:
+    """A parsed document together with everything the window needs to display and navigate it.
+
+    Structure is emitted while rendering instead of being scanned back out of the text afterwards. Everything keyed
+    by line uses true line numbers into `lines`, which is what the text window shows.
     """
-    if not BRACKET_RE.search(line):
-        return []
 
-    found: list[str] = []
-    in_string = False
-    escaped = False
-    for char in line:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-        elif char == '"':
-            in_string = True
-        elif char in OPENERS or char in CLOSERS:
-            found.append(char)
-    return found
+    lines: list[str] = field(default_factory=list)
+    root: Node | None = None
+    nodes: dict[int, Node] = field(default_factory=dict)  # line -> the value introduced there
+    paths: dict[int, JsonPath] = field(default_factory=dict)
+    line_of_parts: dict[tuple[str, ...], int] = field(default_factory=dict)
+    blocks: Blocks = field(default_factory=Blocks)
+    key_spans: dict[int, tuple[int, int]] = field(default_factory=dict)
+    value_spans: dict[int, tuple[int, int]] = field(default_factory=dict)  # members only; an element has no key
+    scalar_items: dict[int, list[int]] = field(default_factory=dict)  # block opening line -> its scalar members
+    closing_column: dict[int, int] = field(default_factory=dict)  # closing line -> column of its bracket (JSON only)
+    style: str = "json"
+    warning: str | None = None
+    refs: list[Ref] = field(default_factory=list)
+    refs_by_line: dict[int, list[Ref]] = field(default_factory=dict)
+    used_by: dict[tuple[str, ...], list[Ref]] = field(default_factory=dict)  # target path -> refs pointing at it
+
+    def key_of(self, line: int) -> str | None:
+        node = self.nodes.get(line)
+        return node.key if node is not None else None
+
+    def resolve_pointer(self, pointer: str) -> Node | None:
+        """Follow a JSON Pointer from the root, e.g. '#/components/schemas/Pet'.
+
+        Walking the node tree rather than the path text avoids having to reverse the way array indices are folded
+        into their parent segment: a pointer says /servers/0, a path says servers[0].
+        """
+        if not pointer.startswith("#"):
+            return None
+        body = pointer[1:].lstrip("/")
+        node = self.root
+        if not body:
+            return node
+
+        for raw in body.split("/"):
+            token = raw.replace("~1", "/").replace("~0", "~")  # in this order: ~01 must decode to ~1
+            if node is None:
+                return None
+            if node.kind == "mapping":
+                node = node.child(token)
+            elif node.kind == "sequence" and token.isdigit() and int(token) < len(node.children):
+                node = node.children[int(token)]
+            else:
+                return None
+        return node
+
+    def ref_at(self, line: int, column: int) -> Ref | None:
+        for ref in self.refs_by_line.get(line, []):
+            if ref.span[0] <= column < ref.span[1]:
+                return ref
+        return None
+
+    def fold_end(self, opened: int) -> str | None:
+        """Where a fold of this block should stop eliding.
+
+        JSON stops at the closing bracket, leaving `"key": [ ... ],` readable on one line. YAML has no closing
+        bracket to keep, so the fold runs to the end of the block's last line.
+        """
+        closed = self.blocks.close_of.get(opened)
+        if closed is None:
+            return None
+        column = self.closing_column.get(closed)
+        return f"{closed}.{column}" if column is not None else f"{closed}.end"
 
 
-# --------------------------------------------------------------------------------------------------------- UI --
+def index_refs(document: Document) -> None:
+    """Find every $ref and resolve the internal ones, recording who points at what.
+
+    Runs once the whole tree exists, since a pointer may name something defined further down the file.
+    """
+    for line, node in sorted(document.nodes.items()):
+        if node.key != REF_KEY or not isinstance(node.value, str):
+            continue
+        span = document.value_spans.get(line) or (0, len(document.lines[line - 1]))
+        ref = Ref(line, span, node.value)
+        target = document.resolve_pointer(node.value)
+        if target is not None:
+            ref.target_line, ref.target_parts = target.line, target.parts
+            document.used_by.setdefault(target.parts, []).append(ref)
+        document.refs.append(ref)
+        document.refs_by_line.setdefault(line, []).append(ref)
+
+
+def _scalar_text(value: object) -> str:
+    """A scalar the way json.dumps writes it, so the rendering matches jq character for character."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _path_text(prefix: str, key: str) -> str:
+    return f"{prefix}.{key}" if PLAIN_KEY_RE.match(key) else f'{prefix}["{key}"]'
+
+
+def build_document(data: object) -> Document:
+    """Render `data` and record its structure in the same walk.
+
+    The layout is jq's, which is also json.dumps(indent=2): one member per line, two-space nesting, and an empty
+    container kept inline. Scalars are handed to json.dumps so escaping and number formatting cannot drift.
+    """
+    document = Document()
+
+    if isinstance(data, str):  # `jq -r .` prints a document that is just a string raw, over as many lines as it has
+        document.lines = data.splitlines() or [""]
+        document.root = Node("scalar", (), ".", None, 1, value=data)
+        for line in range(1, len(document.lines) + 1):
+            document.nodes[line] = document.root
+            document.paths[line] = JsonPath(".", ())
+            document.blocks.enclosing[line] = 0
+        document.line_of_parts[()] = 1
+        return document
+
+    def emit(
+        value: object, parts: tuple[str, ...], path: str, prefix: str, key: str | None, indent: int, parent: int
+    ) -> Node:
+        pad = " " * indent
+        head = f"{pad}{_scalar_text(key)}: " if key is not None else pad
+        line = len(document.lines) + 1
+        document.blocks.enclosing[line] = parent
+        if key is not None:
+            document.key_spans[line] = (len(pad), len(pad) + len(_scalar_text(key)))
+
+        if isinstance(value, dict) and value:
+            node = Node("mapping", parts, path, key, line)
+            document.lines.append(f"{head}{{")
+            if key is not None:
+                document.value_spans[line] = (len(head), len(head) + 1)
+            for position, (child_key, child_value) in enumerate(value.items()):
+                child = emit(
+                    child_value,
+                    (*parts, child_key),
+                    _path_text(prefix, child_key),
+                    _path_text(prefix, child_key),
+                    child_key,
+                    indent + JSON_INDENT,
+                    line,
+                )
+                node.children.append(child)
+                if position < len(value) - 1:
+                    document.lines[-1] += ","
+            node.close_line = len(document.lines) + 1
+            document.blocks.enclosing[node.close_line] = line
+            document.closing_column[node.close_line] = len(pad)
+            document.lines.append(f"{pad}}}")
+        elif isinstance(value, list) and value:
+            node = Node("sequence", parts, path, key, line)
+            document.lines.append(f"{head}[")
+            if key is not None:
+                document.value_spans[line] = (len(head), len(head) + 1)
+            for position, item in enumerate(value):
+                element = _element_parts(parts, position)
+                child = emit(
+                    item,
+                    element,
+                    f"{prefix}[{position}]",
+                    f"{prefix}[{position}]",
+                    None,
+                    indent + JSON_INDENT,
+                    line,
+                )
+                node.children.append(child)
+                if position < len(value) - 1:
+                    document.lines[-1] += ","
+            node.close_line = len(document.lines) + 1
+            document.blocks.enclosing[node.close_line] = line
+            document.closing_column[node.close_line] = len(pad)
+            document.lines.append(f"{pad}]")
+        else:  # a scalar, or a container jq keeps on one line because it is empty
+            if isinstance(value, dict):
+                kind, body = "mapping", "{}"
+            elif isinstance(value, list):
+                kind, body = "sequence", "[]"
+            else:
+                kind, body = "scalar", _scalar_text(value)
+            node = Node(kind, parts, path, key, line, value=value if kind == "scalar" else None)
+            document.lines.append(head + body)
+            if key is not None:
+                document.value_spans[line] = (len(head), len(head) + len(body))
+
+        document.nodes[line] = node
+        document.paths[line] = JsonPath(path, parts)
+        document.line_of_parts.setdefault(parts, line)
+        if node.close_line is not None:
+            document.blocks.close_of[line] = node.close_line
+            document.blocks.open_of[node.close_line] = line
+            document.scalar_items[line] = [child.line for child in node.children if child.is_scalar]
+        return node
+
+    document.root = emit(data, (), ".", "", None, 0, 0)
+    index_refs(document)
+    return document
 
 
 class App(tk.Tk):
@@ -679,12 +1034,15 @@ class App(tk.Tk):
         self._tree_items: dict[tuple[str, ...], str] = {}
         self._syncing = False
         self._hover_after: str | None = None
-        self._hover_spans: list[ColorSpan] = []
+        self._hover_key: object = None
+        self.history = History()
+        self._history_lock = False
         self._match_after: str | None = None
         self._match_origin: int | None = None
         self._setting_search = False
         self._match_lines: dict[str, int] = {}
-        self.blocks = Blocks([])
+        self.document = Document()
+        self.blocks = self.document.blocks
         self.folded: set[int] = set()
         self.current_line: int | None = None
         self.reference_marks = 0
@@ -709,6 +1067,8 @@ class App(tk.Tk):
         self.bind("<Control-b>", lambda _event: self.copy_block())
         self.bind("<Control-C>", lambda _event: self.copy_path())  # Ctrl+Shift+C
         self.bind("<Control-a>", lambda _event: self.select_all())
+        self.bind("<Alt-Left>", lambda _event: self.go_back())
+        self.bind("<Alt-Right>", lambda _event: self.go_forward())
         self.bind("<Control-o>", lambda _event: self.open_json())
         self.bind("<Control-q>", lambda _event: self.destroy())
 
@@ -730,13 +1090,16 @@ class App(tk.Tk):
 
         edit_menu = tk.Menu(menubar, tearoff=False)
         edit_menu.add_command(label="Copy", accelerator="Ctrl+C", command=self.copy_selection)
-        edit_menu.add_command(label="Copy Block as JSON", accelerator="Ctrl+B", command=self.copy_block)
+        edit_menu.add_command(label="Copy Current Block", accelerator="Ctrl+B", command=self.copy_block)
         edit_menu.add_command(label="Copy Path", accelerator="Ctrl+Shift+C", command=self.copy_path)
         edit_menu.add_separator()
         edit_menu.add_command(label="Select All", accelerator="Ctrl+A", command=self.select_all)
         menubar.add_cascade(label="Edit", menu=edit_menu)
 
         view_menu = tk.Menu(menubar, tearoff=False)
+        view_menu.add_command(label="Back", accelerator="Alt+Left", command=self.go_back)
+        view_menu.add_command(label="Forward", accelerator="Alt+Right", command=self.go_forward)
+        view_menu.add_separator()
         view_menu.add_command(label="Collapse All", command=self.collapse_all)
         view_menu.add_command(label="Expand All", command=self.expand_all)
         menubar.add_cascade(label="View", menu=view_menu)
@@ -852,17 +1215,29 @@ class App(tk.Tk):
         self.matches_tree.bind("<<TreeviewSelect>>", self._on_match_select)
 
     def _build_text(self, parent: ttk.Frame) -> None:
-        parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(3, weight=1)
         parent.columnconfigure(1, weight=1)
 
-        # Rows 0-1 hold the clickable path of the current line and its scrollbar; the text starts on row 2. The
+        bar = ttk.Frame(parent, padding=(0, 0, 0, 2))
+        bar.grid(row=0, column=0, columnspan=3, sticky="ew")
+        bar.columnconfigure(2, weight=1)
+        self.back_button = ttk.Button(bar, text="\u25c0", width=3, command=self.go_back)
+        self.back_button.grid(row=0, column=0)
+        self.forward_button = ttk.Button(bar, text="\u25b6", width=3, command=self.go_forward)
+        self.forward_button.grid(row=0, column=1, padx=(2, 6))
+        self.history_choice = tk.StringVar()
+        self.history_box = ttk.Combobox(bar, textvariable=self.history_choice, state="readonly", values=[])
+        self.history_box.grid(row=0, column=2, sticky="ew")
+        self.history_box.bind("<<ComboboxSelected>>", self._on_history_pick)
+
+        # Rows 1-2 hold the clickable path of the current line and its scrollbar; the text starts on row 3. The
         # crumbs live in a frame inside a canvas, which is what lets a deep path scroll sideways instead of clipping.
         self.crumb_canvas = tk.Canvas(
             parent, height=22, highlightthickness=0, borderwidth=0, background=self.cget("background")
         )
-        self.crumb_canvas.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self.crumb_canvas.grid(row=1, column=0, columnspan=3, sticky="ew")
         self.crumb_bar = ttk.Scrollbar(parent, orient="horizontal", command=self.crumb_canvas.xview)
-        self.crumb_bar.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self.crumb_bar.grid(row=2, column=0, columnspan=3, sticky="ew")
         self.crumb_canvas.configure(xscrollcommand=self.crumb_bar.set)
 
         self.breadcrumb = ttk.Frame(self.crumb_canvas, padding=(2, 0, 2, 2))
@@ -886,7 +1261,7 @@ class App(tk.Tk):
             borderwidth=0,
             highlightthickness=0,
         )
-        self.gutter.grid(row=2, column=0, sticky="ns")
+        self.gutter.grid(row=3, column=0, sticky="ns")
 
         self.text = tk.Text(
             parent,
@@ -901,12 +1276,12 @@ class App(tk.Tk):
             borderwidth=0,
             highlightthickness=0,
         )
-        self.text.grid(row=2, column=1, sticky="nsew")
+        self.text.grid(row=3, column=1, sticky="nsew")
 
         self.vbar = ttk.Scrollbar(parent, orient="vertical", command=self._on_vbar)
-        self.vbar.grid(row=2, column=2, sticky="ns")
+        self.vbar.grid(row=3, column=2, sticky="ns")
         self.hbar = ttk.Scrollbar(parent, orient="horizontal", command=self.text.xview)
-        self.hbar.grid(row=3, column=1, sticky="ew")
+        self.hbar.grid(row=4, column=1, sticky="ew")
         self.text.configure(yscrollcommand=self._on_text_scroll, xscrollcommand=self.hbar.set)
 
         # Stack the status tags lowest-first, so every overlap resolves to the worst status present: a block that is
@@ -922,6 +1297,11 @@ class App(tk.Tk):
         for value, color in STATUS_COLORS.items():
             self.text.tag_configure(REFERENCE_TAGS[value], foreground=color, underline=UNDERLINE_REFERENCES)
             self.text.tag_raise(REFERENCE_TAGS[value])
+        # A $ref that resolves is drawn as a link; one that does not is marked but not inviting.
+        self.text.tag_configure("reflink", foreground=REF_COLOR, underline=True)
+        self.text.tag_configure("refdead", foreground=DEAD_REF_COLOR)
+        self.text.tag_raise("reflink")
+        self.text.tag_raise("refdead")
         # Both of these paint only a background, so they sit on top without disturbing the foreground priority.
         self.text.tag_configure("reveal", background=REVEAL_BG)
         self.text.tag_configure("dictvalue", background=VALUE_BG)
@@ -932,7 +1312,7 @@ class App(tk.Tk):
         self.tooltip = Tooltip(self)
         self.context_menu = tk.Menu(self, tearoff=False)
         self.context_menu.add_command(label="Copy", command=self.copy_selection)
-        self.context_menu.add_command(label="Copy Block as JSON", command=self.copy_block)
+        self.context_menu.add_command(label="Copy Current Block", command=self.copy_block)
         self.context_menu.add_command(label="Copy Path", command=self.copy_path)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Select All", command=self.select_all)
@@ -975,9 +1355,14 @@ class App(tk.Tk):
     def open_json(self) -> None:
         """Ask for a file, starting wherever the last one came from."""
         name = filedialog.askopenfilename(
-            title="Open JSON file",
+            title="Open JSON or YAML file",
             initialdir=str(self.recent.paths[0].parent) if self.recent.paths else "",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            filetypes=[
+                ("JSON and YAML", "*.json *.yaml *.yml"),
+                ("JSON", "*.json"),
+                ("YAML", "*.yaml *.yml"),
+                ("All files", "*.*"),
+            ],
         )
         if not name:
             self.set_status("Open cancelled")
@@ -990,32 +1375,33 @@ class App(tk.Tk):
         try:
             self._step("Reading file")
             try:
-                lines = load_json(path)
-            except JsonError as exc:
+                document = load_document(path)
+            except DocumentError as exc:
                 messagebox.showerror(APP_NAME, f"Could not open {path.name}:\n\n{exc}")
                 self.set_status(f"Failed: {path.name}")
                 self.recent.remove(path)
                 self._rebuild_recent_menu()
                 return
 
+            lines, paths = document.lines, document.paths
+
             self._step("Indexing status lines")
-            self.status_lines = collect_status_lines(lines)
+            self.status_lines = collect_status_lines(document)
             self.value_of_line = {line: value for value, numbers in self.status_lines.items() for line in numbers}
 
             self._step("Resolving JSON paths")
-            paths = json_paths(lines)
             self.status_paths = collect_status_paths(paths, self.status_lines)
-            # Earliest line wins, so an ancestor node jumps to where its container opens.
-            self.line_of_parts = {}
-            for number in sorted(paths, reverse=True):
-                self.line_of_parts[paths[number].parts] = number
+            # Recorded as the document was rendered; the earliest line wins, so an ancestor node jumps to where its
+            # container opens.
+            self.line_of_parts = document.line_of_parts
 
             self._index_severity()
 
-            self._step("Scanning blocks")
+            self._step("Reading the structure")
             self.current_json = lines
             self.paths = paths
-            self.blocks = Blocks(lines)
+            self.document = document
+            self.blocks = document.blocks
             self.folded = set()
             self._path = path
 
@@ -1031,7 +1417,7 @@ class App(tk.Tk):
 
     def open_argument(self, path: Path) -> None:
         """Open the file named by --file, refusing anything that is not a .json."""
-        if not is_json_file(path):
+        if not is_supported_file(path):
             messagebox.showwarning(APP_NAME, f"Ignoring {path}:\n\nonly .json files are accepted.")
             self.set_status(f"Ignored {path.name}: not a .json file")
             return
@@ -1090,7 +1476,8 @@ class App(tk.Tk):
         self.paths = {}
         self.value_of_line = {}
         self.line_of_parts = {}
-        self.blocks = Blocks([])
+        self.document = Document()
+        self.blocks = self.document.blocks
         self.folded = set()
         self._path = None
 
@@ -1119,6 +1506,8 @@ class App(tk.Tk):
         self._fill_tree()
         self._clear_matches("Type a word, or click one in quotes")
         self._set_current_line(None)
+        self.history.clear()
+        self._refresh_history()
         self._refresh_gutter()
         return collapsed
 
@@ -1133,7 +1522,7 @@ class App(tk.Tk):
         targets = [
             opened
             for opened in sorted(self.blocks.close_of, reverse=True)
-            if member_key(self.current_json[opened - 1]) in AUTO_COLLAPSE_KEYS
+            if self.document.key_of(opened) in AUTO_COLLAPSE_KEYS
             and self.current_json[opened - 1].rstrip().endswith("[")
             and not self._holds_reference(opened, self.blocks.close_of[opened])
         ]
@@ -1177,6 +1566,7 @@ class App(tk.Tk):
                 self.text.tag_add(value, *indices)
 
         self.reference_marks = self._color_references()
+        self._mark_refs()
 
     def _scalar_items(self, block_open: int, block_close: int) -> list[int]:
         """Lines of the block's own items whose value is not a list or a dict.
@@ -1184,11 +1574,7 @@ class App(tk.Tk):
         Nested containers are left alone: their lines belong to a deeper block and take their colour from that
         block's own status, which is what keeps a failing sub-tree from being repainted by a passing parent.
         """
-        return [
-            number
-            for number in range(block_open + 1, block_close)
-            if self.blocks.enclosing.get(number) == block_open and is_scalar_item(self.current_json[number - 1])
-        ]
+        return self.document.scalar_items.get(block_open, [])
 
     def _reference_targets(self) -> dict[str, tuple[str, StatusEntry]]:
         """Every token to chase through the buffer, mapped to the status colour it should take.
@@ -1326,26 +1712,39 @@ class App(tk.Tk):
         return self.worst_by_parts.get(parts)
 
     def _member_value(self, block_open: int, block_close: int, key: str) -> str | None:
-        """The string value of `key` in the block: a direct member if there is one, otherwise anywhere below."""
-        span = range(block_open + 1, block_close)
-        direct = [
-            number
-            for number in span
-            if self.blocks.enclosing.get(number) == block_open and member_key(self.current_json[number - 1]) == key
-        ]
-        # Only worth a second sweep when the key is not a direct member.
-        deeper = direct or [number for number in span if member_key(self.current_json[number - 1]) == key]
-        for number in deeper:
-            member = MEMBER_RE.match(self.current_json[number - 1].strip())
-            if member is None:
-                continue
-            try:
-                value = json.loads(member.group("rest").rstrip(",").rstrip())
-            except ValueError:
-                continue
-            if isinstance(value, str):
-                return value
+        """The string value of `key` in the block: a direct member if there is one, otherwise anywhere below.
+
+        Read from the parsed tree, so a value is whatever the document said it was - no re-reading of the rendered
+        line, and no confusion over quoting or escapes.
+        """
+        node = self.document.nodes.get(block_open)
+        if node is None:
+            return None
+
+        direct = node.child(key)
+        if direct is not None:
+            return direct.value if isinstance(direct.value, str) else None
+
+        pending = list(node.children)
+        while pending:  # breadth first, so the shallowest match wins
+            current = pending.pop(0)
+            if current.key == key and isinstance(current.value, str):
+                return current.value
+            pending.extend(current.children)
         return None
+
+    def _mark_refs(self) -> None:
+        """Underline every $ref that resolves inside this document, and mark the ones that do not."""
+        for tag in ("reflink", "refdead"):
+            self.text.tag_remove(tag, "1.0", "end")
+
+        ranges: dict[str, list[str]] = {"reflink": [], "refdead": []}
+        for ref in self.document.refs:
+            tag = "reflink" if ref.resolved else "refdead"
+            ranges[tag] += [f"{ref.line}.{ref.span[0]}", f"{ref.line}.{ref.span[1]}"]
+        for tag, indices in ranges.items():
+            if indices:
+                self.text.tag_add(tag, *indices)
 
     def _breadcrumb_spans(self, block_open: int) -> list[tuple[int, int, int]]:
         """(line, start column, end column) for the "key" token of the coloured block and every block enclosing it.
@@ -1355,7 +1754,7 @@ class App(tk.Tk):
         """
         found = []
         for ancestor in (block_open, *self.blocks.ancestors(block_open)):
-            span = key_span(self.current_json[ancestor - 1])
+            span = self.document.key_spans.get(ancestor)
             if span is not None:
                 found.append((ancestor, span[0], span[1]))
         return found
@@ -1528,18 +1927,19 @@ class App(tk.Tk):
         if closed is None or opened in self.folded:
             return
 
-        closing_line = self.current_json[closed - 1]
-        indent = len(closing_line) - len(closing_line.lstrip())
+        fold_end = self.document.fold_end(opened)
+        if fold_end is None:
+            return
         tag = self._fold_tag(opened)
 
         self.text.configure(state="normal")
         # Take the colour from the key, which is the only coloured part of a container's opening line.
-        span = key_span(self.current_json[opened - 1])
+        span = self.document.key_spans.get(opened)
         probe = f"{opened}.{span[0]}" if span is not None else f"{opened}.end - 1c"
         inherited = [name for name in self.text.tag_names(probe) if name in STATUS_COLORS]
         self.text.insert(f"{opened}.end", FOLD_MARK, inherited)
         # Elide up to the closing bracket, not past it: the collapsed line reads `"cases": [ ... ],`.
-        self.text.tag_add(tag, f"{opened}.end", f"{closed}.{indent}")
+        self.text.tag_add(tag, f"{opened}.end", fold_end)
         self.text.tag_configure(tag, elide=True)
         self.text.configure(state="disabled")
 
@@ -1671,7 +2071,7 @@ class App(tk.Tk):
             crumb.pack(side="left")
             if target is not None:
                 # Deferred: the handler rebuilds this bar, so the label must not be destroyed inside its own callback.
-                crumb.bind("<Button-1>", lambda _event, jump=target: self.after_idle(self.reveal_line, jump))
+                crumb.bind("<Button-1>", lambda _event, jump=target: self.after_idle(self.go_to, jump))
 
         self.after_idle(self._on_crumb_configure)
 
@@ -1761,7 +2161,9 @@ class App(tk.Tk):
     def _release_sync(self) -> None:
         self._syncing = False
         self._hover_after: str | None = None
-        self._hover_spans: list[ColorSpan] = []
+        self._hover_key: object = None
+        self.history = History()
+        self._history_lock = False
         self._match_after: str | None = None
         self._match_origin: int | None = None
         self._setting_search = False
@@ -1774,6 +2176,68 @@ class App(tk.Tk):
     def _on_match_select(self, _event: tk.Event) -> None:
         self._select_from(self.matches_tree, self._match_lines)
 
+    def go_to(self, line: int, record: bool = True) -> None:
+        """Show `line`, and remember having been there unless we are walking the history itself."""
+        self.reveal_line(line)
+        if record:
+            self._record_visit(line)
+        self._refresh_history()
+
+    def _record_visit(self, line: int) -> None:
+        path = self.paths.get(line)
+        label = path.text if path is not None else ".".join(self._parts_for_line(line)) or "."
+        self.history.visit(self._parts_for_line(line), f"{label}  (line {line})")
+
+    def go_back(self) -> None:
+        self._walk_history(self.history.back())
+
+    def go_forward(self) -> None:
+        self._walk_history(self.history.forward())
+
+    def _walk_history(self, parts: tuple[str, ...] | None) -> None:
+        if parts is None:
+            return
+        line = self.line_of_parts.get(parts)
+        if line is None:  # the document changed under the entry
+            self.set_status("That place is not in this document")
+            self._refresh_history()
+            return
+        self.go_to(line, record=False)
+
+    def _on_history_pick(self, _event: tk.Event) -> None:
+        if self._history_lock:
+            return
+        self._walk_history(self.history.go(self.history_box.current()))
+
+    def _refresh_history(self) -> None:
+        """Redraw the bar: the buttons follow the cursor, and the box shows where we are."""
+        self._history_lock = True
+        self.history_box.configure(values=self.history.labels())
+        if self.history.index >= 0:
+            self.history_box.current(self.history.index)
+        else:
+            self.history_choice.set("")
+        self._history_lock = False
+        self.back_button.configure(state="normal" if self.history.index > 0 else "disabled")
+        ahead = 0 <= self.history.index < len(self.history.entries) - 1
+        self.forward_button.configure(state="normal" if ahead else "disabled")
+
+    def follow_ref(self, ref: Ref) -> None:
+        """Jump to what a $ref points at, or explain why we cannot."""
+        if not ref.internal:
+            self.set_status(f"External reference, not followed: {ref.pointer}")
+            return
+        if not ref.resolved:
+            self.set_status(f"Unresolved reference: {ref.pointer}")
+            return
+
+        # Record where the jump was made from, so Back returns to the $ref rather than to nowhere.
+        self._record_visit(ref.line)
+        self.go_to(ref.target_line)
+        others = len(self.document.used_by.get(ref.target_parts, [])) - 1
+        tail = f", {others} other reference{'' if others == 1 else 's'} point here" if others > 0 else ""
+        self.set_status(f"Followed {ref.pointer} to line {ref.target_line}{tail}")
+
     def _select_from(self, tree: ttk.Treeview, lines: dict[str, int]) -> None:
         """Jump to whatever the selected node names: a leaf's own line, or the container an ancestor stands for."""
         selection = tree.selection()
@@ -1782,7 +2246,7 @@ class App(tk.Tk):
         line = lines.get(selection[0])
         if line is None:
             return
-        self.reveal_line(line)
+        self.go_to(line)
         self.set_status(f"{tree.item(selection[0], 'text')}  (line {line})")
 
     def origins_at(self, line: int, column: int) -> list[ColorSpan]:
@@ -1837,10 +2301,10 @@ class App(tk.Tk):
         return "\n".join(pieces)
 
     def block_json(self, line: int) -> str | None:
-        """The value of the block around `line`, dedented so it stands alone as valid JSON.
+        """The value of the block around `line`, dedented so it stands alone.
 
-        A member line gives its value, not the "key": part, and the trailing comma goes: the point is text another
-        tool will accept. Indentation is measured from the closing bracket, which sits at the block's own level.
+        JSON gives back its brackets, without the "key": part and without the trailing comma, so another tool will
+        accept it. YAML gives back the block's own lines, comments and all, dedented to the left margin.
         """
         opened = self.blocks.opening_line(line)
         if opened is None:
@@ -1849,8 +2313,15 @@ class App(tk.Tk):
         if not opened or closed is None:
             return None
 
+        if self.document.style == "yaml":  # the body is the block; the key line stays behind
+            body = self.current_json[opened:closed]
+            if not body:
+                return None
+            indent = len(body[0]) - len(body[0].lstrip())
+            return "\n".join(row[indent:] for row in body).rstrip()
+
         head = self.current_json[opened - 1]
-        span = value_span(head)
+        span = self.document.value_spans.get(opened)
         closing = self.current_json[closed - 1]
         indent = len(closing) - len(closing.lstrip())
 
@@ -1879,7 +2350,7 @@ class App(tk.Tk):
         return "break"
 
     def copy_block(self) -> str:
-        """Copy the enclosing block as standalone JSON."""
+        """Copy the block the cursor sits in, ready to paste elsewhere."""
         line = self.current_line
         text = self.block_json(line) if line is not None else None
         if text is None:
@@ -1916,19 +2387,33 @@ class App(tk.Tk):
     def _on_text_motion(self, event: tk.Event) -> None:
         """Arm the tooltip when the pointer rests on a coloured item, and drop it as soon as it leaves."""
         position = self._true_position(self.text, event)
-        spans = self.origins_at(*position) if position is not None else []
+        ref = self.document.ref_at(*position) if position is not None else None
+        if ref is not None:
+            key: object = ("ref", ref.line, ref.span)
+            text = self._ref_tooltip(ref)
+        else:
+            spans = self.origins_at(*position) if position is not None else []
+            key, text = spans, self._origin_tooltip(spans) if spans else ""
 
-        if not spans:
+        if not text:
             self._cancel_hover()
             return
-        if spans == self._hover_spans:
+        if key == self._hover_key:
             return  # same item: leave the pending or shown tooltip alone
 
         self._cancel_hover()
-        self._hover_spans = spans
-        text = self._origin_tooltip(spans)
+        self._hover_key = key
         pointer = (event.x_root, event.y_root)
         self._hover_after = self.after(HOVER_DELAY_MS, lambda: self._show_origin(text, *pointer))
+
+    def _ref_tooltip(self, ref: Ref) -> str:
+        if ref.resolved:
+            others = len(self.document.used_by.get(ref.target_parts, [])) - 1
+            tail = f"\n{others} other reference{'' if others == 1 else 's'} point here" if others > 0 else ""
+            return f"$ref \u2192 {'.'.join(ref.target_parts or ())}  (line {ref.target_line}){tail}"
+        if not ref.internal:
+            return f"external reference, not followed:\n{ref.pointer}"
+        return f"unresolved reference:\n{ref.pointer}"
 
     def _show_origin(self, text: str, x: int, y: int) -> None:
         self._hover_after = None
@@ -1938,7 +2423,7 @@ class App(tk.Tk):
         if self._hover_after is not None:
             self.after_cancel(self._hover_after)
             self._hover_after = None
-        self._hover_spans = []
+        self._hover_key = None
         self.tooltip.hide()
 
     def _on_text_click(self, event: tk.Event) -> None:
@@ -1947,6 +2432,11 @@ class App(tk.Tk):
         if position is None:
             return
         line, column = position
+
+        ref = self.document.ref_at(line, column)
+        if ref is not None:
+            self.follow_ref(ref)
+            return
 
         self._set_current_line(line)
         self._sync_tree_to_line(line)
@@ -1959,20 +2449,22 @@ class App(tk.Tk):
         self._search_for(needle, line)
 
     def _highlight_at(self, line: int, column: int) -> bool:
-        """Shade whatever the click identifies: a key's value, or the block a bracket belongs to.
+        """Shade whatever the click identifies: a key's value, or the block the line belongs to.
 
-        Clicking a bracket shades the same extent as clicking the key above it, so either end of a block, and either
-        way of pointing at it, gives the same answer.
+        Aiming at a single bracket character is fiddly, so any click on a line that opens or closes a block shades
+        that block. YAML has no brackets to aim at in the first place, and this works there unchanged.
         """
         self.text.tag_remove("dictvalue", "1.0", "end")
         body = self.current_json[line - 1]
 
-        key = key_span(body)
+        key = self.document.key_spans.get(line)
         if key is not None and key[0] <= column < key[1]:
             return self._shade_value(line)
-        if column < len(body) and body[column] in OPENERS + CLOSERS and not inside_string(body, column):
-            return self._shade_bracket(line, column)
-        return False
+
+        opened = self.blocks.opening_line(line)
+        if opened is not None:
+            return self._shade_block(opened)
+        return self._shade_empty_pair(body, line, column)
 
     def _shade_value(self, line: int) -> bool:
         """Shade the value belonging to the key on `line`.
@@ -1980,36 +2472,35 @@ class App(tk.Tk):
         A container value runs to its closing bracket, so the whole block is shaded; a scalar covers just the value
         itself, leaving the key and the punctuation around it alone.
         """
-        span = value_span(self.current_json[line - 1])
+        if self.blocks.close_of.get(line) is not None:
+            return self._shade_block(line)
+        span = self.document.value_spans.get(line)
         if span is None:
             return False
-
-        closing = self.blocks.close_of.get(line)
-        if closing is not None:  # "key": { ... }  - shade down to the closing bracket
-            self.text.tag_add("dictvalue", f"{line}.{span[0]}", f"{closing}.end")
-        else:
-            self.text.tag_add("dictvalue", f"{line}.{span[0]}", f"{line}.{span[1]}")
+        self.text.tag_add("dictvalue", f"{line}.{span[0]}", f"{line}.{span[1]}")
         return True
 
-    def _shade_bracket(self, line: int, column: int) -> bool:
-        """Shade the block whose bracket sits at `column`, from its opening bracket to its closing one.
-
-        Either bracket of a pair selects the whole block. A container jq kept inline because it is empty - "{}" or
-        "[]" - has no block to speak of, so just the pair itself is shaded.
-        """
-        opened = self.blocks.opening_line(line)
-        if opened is None:  # an empty container, both brackets on this line
-            body = self.current_json[line - 1]
-            start = column if body[column] in OPENERS else column - 1
-            if 0 <= start and body[start : start + 2] in ("{}", "[]"):
-                self.text.tag_add("dictvalue", f"{line}.{start}", f"{line}.{start + 2}")
-                return True
+    def _shade_block(self, opened: int) -> bool:
+        """Shade a whole block, from where its value starts down to its last line."""
+        closed = self.blocks.close_of.get(opened)
+        if closed is None:
             return False
 
-        closing = self.blocks.close_of[opened]
         head = self.current_json[opened - 1]
-        self.text.tag_add("dictvalue", f"{opened}.{len(head.rstrip()) - 1}", f"{closing}.end")
+        span = self.document.value_spans.get(opened)
+        start = span[0] if span is not None else max(0, len(head.rstrip()) - 1)
+        self.text.tag_add("dictvalue", f"{opened}.{start}", f"{closed}.end")
         return True
+
+    def _shade_empty_pair(self, body: str, line: int, column: int) -> bool:
+        """An empty container is a pair of brackets and nothing else; shade just the pair."""
+        if column >= len(body) or body[column] not in OPENERS + CLOSERS or inside_string(body, column):
+            return False
+        start = column if body[column] in OPENERS else column - 1
+        if start >= 0 and body[start : start + 2] in ("{}", "[]"):
+            self.text.tag_add("dictvalue", f"{line}.{start}", f"{line}.{start + 2}")
+            return True
+        return False
 
     def _selected_word(self, line: int, column: int) -> str | None:
         """An explicit selection wins - double-clicking a word selects it - otherwise the quoted word under the click."""
@@ -2017,7 +2508,20 @@ class App(tk.Tk):
             chosen = self.text.get("sel.first", "sel.last").strip().strip('"')
             if chosen:
                 return chosen
-        return quoted_token_at(self.current_json[line - 1], column)
+        body = self.current_json[line - 1]
+        token = quoted_token_at(body, column)
+        if token is not None:
+            return token
+
+        # YAML writes most keys and many values without quotes; treat those as words too.
+        key = self.document.key_spans.get(line)
+        if key is not None and key[0] <= column < key[1]:
+            return self.document.key_of(line)
+
+        value = self.document.value_spans.get(line)
+        if value is not None and value[0] <= column < value[1]:
+            return _plain_word(body[value[0] : value[1]])
+        return None
 
     # ------------------------------------------------------------------------------------------------- events --
 
@@ -2064,7 +2568,9 @@ class App(tk.Tk):
     def show_about(self) -> None:
         messagebox.showinfo(
             APP_NAME,
-            f"{APP_NAME}\nFormats JSON like `jq --indent {JSON_INDENT} -r .`, without needing jq\n"
+            f"{APP_NAME} \u2014 a viewer for JSON and YAML\n"
+            f"JSON is formatted like `jq --indent {JSON_INDENT} -r .`, without needing jq;\n"
+            "YAML keeps the file's own text.\n"
             "Pick a path on the left to jump to it; click the gutter or double-click a bracket to fold.\n"
             "Type in the search box to narrow the tree; click a quoted word to find it elsewhere.",
         )
