@@ -1,82 +1,93 @@
-# jy — test suite
+# jy
+
+A viewer for large JSON and YAML documents, built with tkinter. It exists for two jobs:
+reading ReversingLabs `report.rl.json` scans, and finding your way around OpenAPI
+specifications.
 
 ```
-make install-dev            # ruamel.yaml, pytest, ruff
-make test                   # everything
-make test-fast              # no display needed
-make test-gui               # only the widget tests
-make test-headless          # everything, on a machine with no display
-make check                  # formatting, lint, then the display-free tests
+make install-dev
+make run FILE=examples/report.rl.json
+make run FILE=examples/openapi.yaml
 ```
 
-`make help` lists every target. All of it works without make too: `pytest`,
-`pytest -m "not gui"`, `xvfb-run -a pytest`.
+`jy.py` is a single file with one dependency (`ruamel.yaml`, for YAML). `jq` is **not**
+required: JSON is formatted the way `jq --indent 2 -r .` would, in pure Python.
 
-`conftest.py` finds `jy.py` itself, so the layout is up to you: the test files can sit in
-`tests/` or flat beside `jy.py`, and the `gui` marker is registered in `conftest.py` rather
-than only in `pytest.ini` — so it works even when that file is not picked up.
+## What it does
 
-## What is where
+**Reads either format.** JSON is rendered; YAML keeps the file's own text, so comments,
+quoting, anchors and formatting survive exactly as written.
 
-| file | needs a display | covers |
-|------|-----------------|--------|
-| `test_document.py` | no | rendering, block structure, paths, folding extents, status detection, both formats |
-| `test_navigation.py` | no | JSON Pointer resolution, the `$ref` index, history semantics, the recent-file store |
-| `test_gui.py` | **yes** | everything that can only be judged by asking the widgets |
-| `test_examples.py` | no | the shipped `examples/` stay loadable and keep demonstrating their features |
+**Folds anything.** Every container collapses, and so does a YAML block scalar (`|`, `>`).
+Empty containers are left alone. Clicking anywhere on a line that opens or closes a block
+shades the whole block.
 
-The split matters. The first two files test the document model, which is pure data and
-fast to run. `test_gui.py` builds a real `jy.App`, loads real files into it and clicks at
-real coordinates — it is the only place where an elided fold, a style map, a tag range or
-a clipboard round trip is actually checked rather than assumed.
+**Colours by status.** A `status` of `pass`, `warning` or `fail` colours the scalar members
+of its block green, orange or red, and tints the dict keys leading down to it, so a failure
+deep in a file is visible from the top. `fail` outranks `warning` outranks `pass`. Hovering
+a coloured item names every `status` field that contributed to its colour.
 
-## Why the GUI tests click instead of calling handlers
+**Follows references.** In an OpenAPI spec, a `$ref` pointing inside the document is a
+link. Click it to jump; Back and Forward, a dropdown of everywhere you have been, and
+`Alt+Left` / `Alt+Right` get you home again — which matters, because schema references are
+routinely cyclic. External refs are marked but never followed.
 
-They use `widget.bbox(index)` to find where a character is on screen and then
-`event_generate` there. Calling `app._on_text_click(fake_event)` would pass even if the
-binding were attached to the wrong widget, the wrong sequence, or nothing at all. Clicking
-proves the wiring.
+**Two trees.** On the left, every `status` path in the document, coloured and searchable,
+with a `NOT` button to invert the filter. On the right, everywhere a word appears: click a
+quoted string, a YAML key or a plain value and it fills the search box.
 
-Two Tk details the tests rely on:
+**Copies things out.** `Copy Current Block` gives you a dedented, standalone fragment that
+another tool will accept — JSON without its key or trailing comma, YAML with its comments
+intact. Also copy the selection, the current line, or the path.
 
-- `text.count("1.0", "end", "displaylines")` counts what is *shown*, so an elided fold is
-  observable. Comparing `get("1.0", "end")` would not notice folding at all.
-- `ttk::style map` is queried through `app.tk.call`, because a selected `Treeview` row
-  drawing its own colour is a property of the style map, not of the row.
+## Keys
 
-## If something fails
+| | |
+|---|---|
+| `Ctrl+O` | open |
+| `Ctrl+C` / `Ctrl+B` / `Ctrl+Shift+C` | copy selection / current block / path |
+| `Ctrl+A` | select all |
+| `Alt+Left` / `Alt+Right` | back / forward |
+| `Ctrl+Q` | quit |
 
-- **Every GUI test skips** — no display. Use `xvfb-run -a pytest`.
-- **`ModuleNotFoundError: ruamel`** — `make install`; YAML support needs it.
-- **`ModuleNotFoundError: tkinter`** — it ships separately from Python on Linux:
-  `sudo apt install python3-tk`, or `sudo dnf install python3-tkinter`. Even the
-  display-free tests import `jy`, so they need it present, just not running.
-- **The hover test hangs or fails** — it runs a short `mainloop` to let the tooltip's
-  `after` timer fire. Under a very slow virtual display, raise the margin in
-  `TestHover.test_hovering_a_coloured_item_names_its_origin`.
-- **Clipboard tests fail on Linux** — Tk's clipboard needs a running window; under
-  `xvfb-run` this works, but on some window managers the selection is only readable while
-  the app is alive. These tests read it before destroying the app, which is the supported
-  case.
-- **A test complains a line is not visible** — `click()` calls `see()` first, but a very
-  small window can still leave a line off screen. The `app` fixture sets `1200x800`.
+Click the gutter or double-click a bracket to fold. Right-click for the copy menu.
 
-## Adding tests
+## Command line
 
-Reference lines by content, not by number:
-
-```python
-from conftest import line_of
-
-line = line_of(document, '"licenses"')
+```
+python3 jy.py                                  # start empty
+python3 jy.py --file=examples/openapi.yaml     # open a file straight away
 ```
 
-The sample documents in `conftest.py` (`REPORT`, `SPEC`) are shaped like the real files —
-an rl.json scan with components, violations and cross-references, and an OpenAPI spec with
-`$ref`s, anchors, a merge key and a block scalar. Extending those is usually better than
-inventing a new fixture, since every rule then gets exercised against the same document.
+Anything that is not `.json`, `.yaml` or `.yml` is refused with a warning. Files over 1 MB
+show a progress window naming each step; a 5 MB report takes a couple of seconds.
 
-## Verified
+The last 25 files opened are remembered in `~/.jy/recent.txt` — the directory is named
+after the script, so renaming `jy.py` moves it.
 
-The whole suite was run under `xvfb-run` before delivery: **177 passed**, GUI tests
-included. `make check` is clean.
+## Layout of the repository
+
+| path | |
+|------|--|
+| `jy.py` | the application, one file |
+| `jy_spec.md` | the specification: numbered rules, the decisions behind them, and the known limits |
+| `tests/` | 177 tests; see `tests/README.md` |
+| `examples/` | a sample scan and a sample spec, both used by the tests |
+| `Makefile` | `make help` lists everything |
+
+## Development
+
+```
+make check         # formatting, lint, then the tests that need no display
+make test          # everything, including the widget tests
+make test-headless # everything, on a machine with no display
+```
+
+Code rules live in `ruff.toml`: 120 columns, four spaces, `ruff format` clean.
+
+## Not handled
+
+Recorded in `jy_spec.md` §B, briefly: only the first document of a multi-document YAML
+file is navigable; YAML flow style (`{a: 1, b: 2}`) puts several members on one line and
+only the first is indexed; external `$ref`s are never loaded; numeric `rule_id`s are not
+cross-referenced.
