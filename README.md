@@ -5,9 +5,16 @@ reading ReversingLabs `report.rl.json` scans, and finding your way around OpenAP
 specifications.
 
 ```
+pip install jy-viewer     # once published; installs the `jy` command
+jy --file=report.rl.json
+```
+
+From a checkout:
+
+```
 make install-dev
 make run FILE=examples/report.rl.json
-make run FILE=examples/openapi.yaml
+make demo
 ```
 
 `jy.py` is a single file with one dependency (`ruamel.yaml`, for YAML). `jq` is **not**
@@ -71,9 +78,10 @@ after the script, so renaming `jy.py` moves it.
 |------|--|
 | `jy.py` | the application, one file |
 | `jy_spec.md` | the specification: numbered rules, the decisions behind them, and the known limits |
-| `tests/` | 177 tests; see `tests/README.md` |
+| `tests/` | 177 tests; see `tests/README.md`. They also run flat beside `jy.py` |
 | `examples/` | a sample scan and a sample spec, both used by the tests |
 | `Makefile` | `make help` lists everything |
+| `pyproject.toml` | packaging; hatchling, with the version read from `jy.py` |
 
 ## Development
 
@@ -84,6 +92,29 @@ make test-headless # everything, on a machine with no display
 ```
 
 Code rules live in `ruff.toml`: 120 columns, four spaces, `ruff format` clean.
+
+## Packaging
+
+```
+make build          # wheel and sdist into dist/
+make publish-test   # TestPyPI
+make publish        # PyPI
+```
+
+The distribution is **`jy-viewer`**; the import name and the command are both `jy`. They
+differ because `jy` on PyPI is already an unrelated JavaScript-interop package. The version
+lives in one place, `__version__` in `jy.py`, and hatchling reads it from there.
+
+Before the first upload: choose a licence, add the file, and uncomment the `license` and
+`project.urls` lines in `pyproject.toml`. Then rehearse on TestPyPI —
+
+```
+make build && make publish-test
+pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple jy-viewer
+```
+
+`tkinter` cannot be installed by pip. A system without it gets a clear message naming the
+package to install rather than a bare `ModuleNotFoundError`.
 
 ## Not handled
 

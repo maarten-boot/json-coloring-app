@@ -23,14 +23,25 @@ import bisect
 import json
 import re
 import sys
-import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ModuleNotFoundError as exc:  # pip cannot supply tkinter; the system package manager has to
+    raise SystemExit(
+        "jy needs tkinter, which ships separately from Python on most Linux distributions:\n"
+        "  Debian/Ubuntu   sudo apt install python3-tk\n"
+        "  Fedora          sudo dnf install python3-tkinter\n"
+        "  macOS/Windows   use a python.org build, which includes it"
+    ) from exc
 from typing import NamedTuple
 
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
+
+__version__ = "0.1.0"
 
 APP_NAME = "jy"
 # L: the last opened files live in ~/.<script name>/recent.txt, newest first.
@@ -214,8 +225,8 @@ def file_size(path: Path) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Read --file=<path>. Unknown arguments are left alone rather than killing the app before it draws."""
-    parser = argparse.ArgumentParser(prog=APP_NAME, description="Browse a JSON report.")
-    parser.add_argument("--file", dest="file", default=None, help="JSON file to open at startup")
+    parser = argparse.ArgumentParser(prog=APP_NAME, description="Browse a JSON or YAML document.")
+    parser.add_argument("--file", dest="file", default=None, help="JSON or YAML file to open at startup")
     known, _unknown = parser.parse_known_args(argv)
     return known
 

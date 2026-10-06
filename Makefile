@@ -33,7 +33,19 @@ test-gui:  ## only the widget tests
 test-headless:  ## the whole suite under a virtual display
 	xvfb-run -a $(PYTHON) -m pytest
 
-prep: clean format check lint
+build:  ## build the wheel and the sdist into dist/
+	rm -rf dist
+	$(PYTHON) -m build
+
+publish-test:  ## upload to TestPyPI first; install from there before the real thing
+	$(PYTHON) -m twine upload --repository testpypi dist/*
+
+publish:  ## upload to PyPI
+	$(PYTHON) -m twine check dist/*
+	$(PYTHON) -m twine upload dist/*
+
+version:  ## print the version jy reports
+	@$(PYTHON) -c "import jy; print(jy.__version__)"
 
 lint:  ## report style problems
 	ruff check .
@@ -47,7 +59,7 @@ check:  ## before committing: formatting, lint, then the display-free tests
 	$(PYTHON) -m pytest -m "not gui"
 
 clean:  ## remove caches
-	rm -rf .pytest_cache .ruff_cache
+	rm -rf .pytest_cache .ruff_cache dist build *.egg-info
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +
 
-.PHONY: help install install-dev run demo test test-fast test-gui test-headless lint format check clean
+.PHONY: help install install-dev run demo build publish-test publish version test test-fast test-gui test-headless lint format check clean
